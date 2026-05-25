@@ -1,0 +1,10 @@
+/references/
+*.test
+*.out
+.idea/
+.vscode/
+.DS_Store
+/dist/
+/bin/
+CLAUDE.md
+AGENTS.md
