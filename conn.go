@@ -224,6 +224,12 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	if !ok {
 		return nil, fmt.Errorf("quackdriver: unexpected response %T to PREPARE", body)
 	}
+	// Sanity-check that the response is self-consistent. If the server sends
+	// mismatched name/type counts, fail at PREPARE time rather than during a
+	// later row decode where the error would surface as a bounds violation.
+	if len(prep.ResultNames) != len(prep.ResultTypes) {
+		return nil, fmt.Errorf("quackdriver: PrepareResponse has %d names but %d types", len(prep.ResultNames), len(prep.ResultTypes))
+	}
 	return newRows(ctx, c, prep), nil
 }
 

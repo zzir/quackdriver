@@ -3,6 +3,7 @@ package quackdriver
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"io"
 	"reflect"
@@ -53,14 +54,45 @@ func newRows(ctx context.Context, c *Conn, prep message.PrepareResponse) *Rows {
 // Columns returns the result column names.
 func (r *Rows) Columns() []string { return r.columnNames }
 
-// Close releases the result. Subsequent Next() returns io.EOF.
+// Close releases the result. If the caller closes mid-iteration while the
+// server still has pending chunks (`needsMore`), Close drains them via
+// follow-up FETCH_REQUESTs so the server-side result buffer is freed; without
+// this, the result UUID would dangle until the connection is closed.
+//
+// Drain errors are returned but the Rows is always marked closed so a second
+// Close is a cheap no-op. A canceled context (typical during graceful
+// shutdown) is not surfaced as an error.
 func (r *Rows) Close() error {
+	if r.closed {
+		return nil
+	}
 	r.closed = true
+	drainErr := r.drain()
 	r.chunks = nil
+	if drainErr != nil && !errors.Is(drainErr, context.Canceled) && !errors.Is(drainErr, context.DeadlineExceeded) {
+		return drainErr
+	}
 	return nil
 }
 
-// Next reads the next row into dest. dest is pre-sized to len(Columns()).
+// drain pulls FETCH_REQUESTs until the server signals exhaustion with an
+// empty result list. Called from Close; safe to call on an already-exhausted
+// Rows (it returns immediately).
+func (r *Rows) drain() error {
+	for r.needsMore {
+		if err := r.fetchMore(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Next reads the next row into dest. dest is pre-sized by database/sql to
+// len(Columns()). We defensively guard against a misbehaving server that
+// could send a chunk whose column or row counts do not match what was
+// promised in the PrepareResponse — without this, a short Columns slice or
+// short column vector would crash the client with an index-out-of-range
+// panic deep inside the standard library.
 func (r *Rows) Next(dest []driver.Value) error {
 	if r.closed {
 		return io.EOF
@@ -73,8 +105,16 @@ func (r *Rows) Next(dest []driver.Value) error {
 				r.rowInChunk = 0
 				continue
 			}
+			if len(chunk.Columns) < len(dest) {
+				return fmt.Errorf("quackdriver: chunk has %d columns, expected at least %d", len(chunk.Columns), len(dest))
+			}
 			for col := range dest {
-				dest[col] = chunk.Columns[col][r.rowInChunk]
+				column := chunk.Columns[col]
+				if r.rowInChunk >= len(column) {
+					return fmt.Errorf("quackdriver: column %d has %d rows but chunk declared %d (row index %d)",
+						col, len(column), chunk.RowCount, r.rowInChunk)
+				}
+				dest[col] = column[r.rowInChunk]
 			}
 			r.rowInChunk++
 			return nil
