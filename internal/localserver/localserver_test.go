@@ -17,7 +17,7 @@ func TestPickFreePort(t *testing.T) {
 
 func TestPickFreePortUnique(t *testing.T) {
 	ports := map[int]bool{}
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		port, err := pickFreePort()
 		if err != nil {
 			t.Fatal(err)
@@ -41,10 +41,10 @@ func TestGenerateToken(t *testing.T) {
 
 func TestGenerateTokenUnique(t *testing.T) {
 	seen := map[string]bool{}
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		tok := generateToken()
 		if seen[tok] {
-			t.Fatalf("duplicate token after %d iterations", i)
+			t.Fatal("duplicate token generated")
 		}
 		seen[tok] = true
 	}

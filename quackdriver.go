@@ -13,6 +13,7 @@
 package quackdriver
 
 import (
+	"context"
 	"database/sql"
 	"database/sql/driver"
 
@@ -37,7 +38,7 @@ func (Driver) Open(dsn string) (driver.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return c.connect(nil)
+	return c.connect(context.TODO())
 }
 
 // OpenConnector parses a DSN and returns a reusable Connector.

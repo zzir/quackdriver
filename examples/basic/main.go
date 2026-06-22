@@ -44,7 +44,7 @@ func main() {
 	}
 	mustExec := func(q string, args ...any) {
 		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
-			tx.Rollback()
+			_ = tx.Rollback()
 			log.Fatalf("exec %q: %v", q, err)
 		}
 	}

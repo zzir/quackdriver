@@ -23,7 +23,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 	fmt.Println("using temp dir:", dir)
 
 	dbFile := filepath.Join(dir, "demo.db")

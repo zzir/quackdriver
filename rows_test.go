@@ -3,6 +3,7 @@ package quackdriver
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
 	"io"
 	"strings"
 	"testing"
@@ -85,7 +86,7 @@ func TestRowsCloseIdempotent(t *testing.T) {
 		t.Fatalf("second close should be no-op: %v", err)
 	}
 	dest := make([]driver.Value, 1)
-	if err := r.Next(dest); err != io.EOF {
+	if err := r.Next(dest); !errors.Is(err, io.EOF) {
 		t.Fatalf("Next on closed: got %v want io.EOF", err)
 	}
 }

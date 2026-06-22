@@ -104,7 +104,7 @@ func (r *Reader) ReadBool() (bool, error) {
 func (r *Reader) ReadULEB128() (uint64, error) {
 	var result uint64
 	var shift uint
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		b, err := r.ReadByte()
 		if err != nil {
 			return 0, err
@@ -122,7 +122,7 @@ func (r *Reader) ReadULEB128() (uint64, error) {
 func (r *Reader) ReadSLEB128() (int64, error) {
 	var result int64
 	var shift uint
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		b, err := r.ReadByte()
 		if err != nil {
 			return 0, err

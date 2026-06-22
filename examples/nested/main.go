@@ -38,15 +38,15 @@ func main() {
 			log.Fatalf("%s: %v", q, err)
 		}
 		if !rows.Next() {
-			rows.Close()
+			_ = rows.Close()
 			log.Fatalf("%s: no rows", q)
 		}
 		var v any
 		if err := rows.Scan(&v); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			log.Fatalf("%s scan: %v", q, err)
 		}
 		fmt.Printf("%-50s -> %T %v\n", q, v, v)
-		rows.Close()
+		_ = rows.Close()
 	}
 }

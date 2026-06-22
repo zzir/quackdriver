@@ -129,7 +129,7 @@ func (r *Rows) Next(dest []driver.Value) error {
 }
 
 func (r *Rows) fetchMore() error {
-	_, body, err := r.conn.roundTrip(r.ctx, message.Header{}, message.FetchRequest{ResultUUID: r.resultUUID})
+	_, body, err := r.conn.roundTrip(r.ctx, message.FetchRequest{ResultUUID: r.resultUUID})
 	if err != nil {
 		return err
 	}

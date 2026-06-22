@@ -42,7 +42,7 @@ func readFixture(t *testing.T, name string) []byte {
 
 // decodeFixture decodes a fixture and asserts both the message type and the
 // body's concrete Go type via the supplied checker.
-func decodeFixture(t *testing.T, name string, wantType message.Type) (message.Header, message.Body) {
+func decodeFixture(t *testing.T, name string, wantType message.Type) message.Body {
 	t.Helper()
 	raw := readFixture(t, name)
 	h, body, err := message.Decode(raw)
@@ -52,7 +52,7 @@ func decodeFixture(t *testing.T, name string, wantType message.Type) (message.He
 	if h.Type != wantType {
 		t.Fatalf("%s: header type = %d, want %d", name, h.Type, wantType)
 	}
-	return h, body
+	return body
 }
 
 // requestRoundTrip asserts a client-side message (which we generated and dumped
@@ -79,7 +79,7 @@ func requestRoundTrip(t *testing.T, name string, msg message.Body) {
 }
 
 func TestGoldenHandshake(t *testing.T) {
-	_, body := decodeFixture(t, "handshake.resp.bin", message.TypeConnectionResponse)
+	body := decodeFixture(t, "handshake.resp.bin", message.TypeConnectionResponse)
 	resp := body.(message.ConnectionResponse)
 	if resp.ServerDuckdbVersion == "" {
 		t.Fatalf("server duckdb version is empty: %+v", resp)
@@ -124,7 +124,7 @@ func TestGoldenHandshakeRequest(t *testing.T) {
 func TestGoldenSelectInt(t *testing.T) {
 	requestRoundTrip(t, "select_int.req.bin", message.PrepareRequest{SQL: "SELECT 42::INTEGER AS i"})
 
-	_, body := decodeFixture(t, "select_int.resp.bin", message.TypePrepareResponse)
+	body := decodeFixture(t, "select_int.resp.bin", message.TypePrepareResponse)
 	resp := body.(message.PrepareResponse)
 	if !reflect.DeepEqual(resp.ResultNames, []string{"i"}) {
 		t.Fatalf("names: %v", resp.ResultNames)
@@ -147,7 +147,7 @@ func TestGoldenSelectInt(t *testing.T) {
 func TestGoldenSelectVarcharUnicode(t *testing.T) {
 	requestRoundTrip(t, "select_varchar.req.bin", message.PrepareRequest{SQL: "SELECT 'hello, 🦆' AS s"})
 
-	_, body := decodeFixture(t, "select_varchar.resp.bin", message.TypePrepareResponse)
+	body := decodeFixture(t, "select_varchar.resp.bin", message.TypePrepareResponse)
 	resp := body.(message.PrepareResponse)
 	if got := resp.Results[0].Columns[0][0]; got != "hello, 🦆" {
 		t.Fatalf("value: %q", got)
@@ -155,7 +155,7 @@ func TestGoldenSelectVarcharUnicode(t *testing.T) {
 }
 
 func TestGoldenSelectNull(t *testing.T) {
-	_, body := decodeFixture(t, "select_null.resp.bin", message.TypePrepareResponse)
+	body := decodeFixture(t, "select_null.resp.bin", message.TypePrepareResponse)
 	resp := body.(message.PrepareResponse)
 	if got := resp.Results[0].Columns[0][0]; got != nil {
 		t.Fatalf("value: %v (want nil)", got)
@@ -163,7 +163,7 @@ func TestGoldenSelectNull(t *testing.T) {
 }
 
 func TestGoldenSelectHugeInt(t *testing.T) {
-	_, body := decodeFixture(t, "select_hugeint.resp.bin", message.TypePrepareResponse)
+	body := decodeFixture(t, "select_hugeint.resp.bin", message.TypePrepareResponse)
 	resp := body.(message.PrepareResponse)
 	got := resp.Results[0].Columns[0][0]
 	bi, ok := got.(*big.Int)
@@ -177,7 +177,7 @@ func TestGoldenSelectHugeInt(t *testing.T) {
 }
 
 func TestGoldenSelectBool(t *testing.T) {
-	_, body := decodeFixture(t, "select_bool.resp.bin", message.TypePrepareResponse)
+	body := decodeFixture(t, "select_bool.resp.bin", message.TypePrepareResponse)
 	resp := body.(message.PrepareResponse)
 	if resp.Results[0].Columns[0][0] != true {
 		t.Fatalf("col0: %v", resp.Results[0].Columns[0][0])
@@ -188,12 +188,12 @@ func TestGoldenSelectBool(t *testing.T) {
 }
 
 func TestGoldenSelectMultirow(t *testing.T) {
-	_, body := decodeFixture(t, "select_multirow.resp.bin", message.TypePrepareResponse)
+	body := decodeFixture(t, "select_multirow.resp.bin", message.TypePrepareResponse)
 	resp := body.(message.PrepareResponse)
 	if resp.Results[0].RowCount != 5 {
 		t.Fatalf("row count: %d", resp.Results[0].RowCount)
 	}
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		// range(0, 5) returns BIGINT-typed values.
 		if got := resp.Results[0].Columns[0][i]; got != int64(i) {
 			t.Fatalf("row %d: %v (%T)", i, got, got)
@@ -202,7 +202,7 @@ func TestGoldenSelectMultirow(t *testing.T) {
 }
 
 func TestGoldenSelectList(t *testing.T) {
-	_, body := decodeFixture(t, "select_list.resp.bin", message.TypePrepareResponse)
+	body := decodeFixture(t, "select_list.resp.bin", message.TypePrepareResponse)
 	resp := body.(message.PrepareResponse)
 	got := resp.Results[0].Columns[0][0]
 	values, ok := got.([]any)
@@ -216,7 +216,7 @@ func TestGoldenSelectList(t *testing.T) {
 }
 
 func TestGoldenSelectStruct(t *testing.T) {
-	_, body := decodeFixture(t, "select_struct.resp.bin", message.TypePrepareResponse)
+	body := decodeFixture(t, "select_struct.resp.bin", message.TypePrepareResponse)
 	resp := body.(message.PrepareResponse)
 	got := resp.Results[0].Columns[0][0]
 	row, ok := got.(map[string]any)
@@ -232,7 +232,7 @@ func TestGoldenSelectStruct(t *testing.T) {
 }
 
 func TestGoldenSelectDecimal(t *testing.T) {
-	_, body := decodeFixture(t, "select_decimal.resp.bin", message.TypePrepareResponse)
+	body := decodeFixture(t, "select_decimal.resp.bin", message.TypePrepareResponse)
 	resp := body.(message.PrepareResponse)
 	got := resp.Results[0].Columns[0][0]
 	if got != "12345.67" {
@@ -241,7 +241,7 @@ func TestGoldenSelectDecimal(t *testing.T) {
 }
 
 func TestGoldenSelectMultichunkFetch(t *testing.T) {
-	_, body := decodeFixture(t, "select_multichunk.resp.bin", message.TypePrepareResponse)
+	body := decodeFixture(t, "select_multichunk.resp.bin", message.TypePrepareResponse)
 	resp := body.(message.PrepareResponse)
 	if !resp.NeedsMoreFetch {
 		t.Fatal("expected NeedsMoreFetch=true for a 200k-row range")
@@ -253,7 +253,7 @@ func TestGoldenSelectMultichunkFetch(t *testing.T) {
 
 	requestRoundTrip(t, "fetch_more.req.bin", message.FetchRequest{ResultUUID: resp.ResultUUID})
 
-	_, body2 := decodeFixture(t, "fetch_more.resp.bin", message.TypeFetchResponse)
+	body2 := decodeFixture(t, "fetch_more.resp.bin", message.TypeFetchResponse)
 	fr := body2.(message.FetchResponse)
 	if len(fr.Results) == 0 {
 		t.Fatal("FetchResponse has no chunks")
@@ -261,7 +261,7 @@ func TestGoldenSelectMultichunkFetch(t *testing.T) {
 }
 
 func TestGoldenErrorBadSQL(t *testing.T) {
-	_, body := decodeFixture(t, "error_bad_sql.resp.bin", message.TypeErrorResponse)
+	body := decodeFixture(t, "error_bad_sql.resp.bin", message.TypeErrorResponse)
 	resp := body.(message.ErrorResponse)
 	if resp.Message == "" {
 		t.Fatal("error message is empty")
@@ -270,7 +270,7 @@ func TestGoldenErrorBadSQL(t *testing.T) {
 
 func TestGoldenDisconnect(t *testing.T) {
 	requestRoundTrip(t, "disconnect.req.bin", message.DisconnectMessage{})
-	_, body := decodeFixture(t, "disconnect.resp.bin", message.TypeSuccessResponse)
+	body := decodeFixture(t, "disconnect.resp.bin", message.TypeSuccessResponse)
 	if _, ok := body.(message.SuccessResponse); !ok {
 		t.Fatalf("body type: %T", body)
 	}

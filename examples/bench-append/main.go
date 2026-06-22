@@ -27,20 +27,20 @@ func main() {
 	const N = 10000
 
 	// Setup.
-	db.ExecContext(ctx, "DROP TABLE IF EXISTS bench_t")
-	db.ExecContext(ctx, "CREATE TABLE bench_t (id BIGINT, name VARCHAR, score DOUBLE)")
+	_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS bench_t")
+	_, _ = db.ExecContext(ctx, "CREATE TABLE bench_t (id BIGINT, name VARCHAR, score DOUBLE)")
 
 	// INSERT path.
 	insertStart := time.Now()
 	tx, _ := db.BeginTx(ctx, nil)
-	for i := 0; i < N; i++ {
+	for i := range N {
 		if _, err := tx.ExecContext(ctx, "INSERT INTO bench_t VALUES (?, ?, ?)", int64(i), "row", float64(i)*1.5); err != nil {
 			log.Fatal(err)
 		}
 	}
-	tx.Commit()
+	_ = tx.Commit()
 	insertDur := time.Since(insertStart)
-	db.ExecContext(ctx, "DELETE FROM bench_t")
+	_, _ = db.ExecContext(ctx, "DELETE FROM bench_t")
 
 	// APPEND path.
 	rows := make([][]any, N)
@@ -49,12 +49,12 @@ func main() {
 	}
 	appendStart := time.Now()
 	conn, _ := db.Conn(ctx)
-	conn.Raw(func(d any) error {
+	_ = conn.Raw(func(d any) error {
 		return d.(*quackdriver.Conn).Append(ctx, "bench_t",
 			[]quackdriver.AppendColumn{{Name: "id", Type: "BIGINT"}, {Name: "name", Type: "VARCHAR"}, {Name: "score", Type: "DOUBLE"}},
 			rows)
 	})
-	conn.Close()
+	_ = conn.Close()
 	appendDur := time.Since(appendStart)
 
 	fmt.Printf("INSERT %d rows: %v (%.0f rows/sec)\n", N, insertDur, float64(N)/insertDur.Seconds())

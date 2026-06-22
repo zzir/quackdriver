@@ -29,7 +29,7 @@ func buildVarcharChunk(t *testing.T, claimed, actual int) []byte {
 						w.WriteField(100, func(w *codec.Writer) { w.WriteBool(false) }) // no validity
 						w.WriteField(102, func(w *codec.Writer) {
 							w.WriteULEB128(uint64(actual))
-							for i := 0; i < actual; i++ {
+							for range actual {
 								w.WriteBlob([]byte("x"))
 							}
 						})

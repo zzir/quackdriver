@@ -52,15 +52,15 @@ func main() {
 			log.Fatalf("%s: query: %v", c.sql, err)
 		}
 		if !rows.Next() {
-			rows.Close()
+			_ = rows.Close()
 			log.Fatalf("%s: no rows", c.sql)
 		}
 		var got any
 		if err := rows.Scan(&got); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			log.Fatalf("%s: scan: %v", c.sql, err)
 		}
-		rows.Close()
+		_ = rows.Close()
 		fmt.Printf("%-40s  want=%-25T got=%-25T value=%v\n", c.sql, c.want, got, got)
 	}
 

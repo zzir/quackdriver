@@ -57,7 +57,7 @@ func (c *Conn) handshake(ctx context.Context) error {
 		MinSupportedQuackVersion: 1,
 		MaxSupportedQuackVersion: 1,
 	}
-	respHeader, respBody, err := c.roundTrip(ctx, message.Header{}, req)
+	respHeader, respBody, err := c.roundTrip(ctx,req)
 	if err != nil {
 		return fmt.Errorf("quackdriver: handshake: %w", err)
 	}
@@ -77,16 +77,14 @@ func (c *Conn) handshake(ctx context.Context) error {
 	return nil
 }
 
-// roundTrip issues one request and waits for a single response. The header's
-// Type is overwritten with body.MessageType() and ClientQueryID is auto-assigned.
-func (c *Conn) roundTrip(ctx context.Context, h message.Header, body message.Body) (message.Header, message.Body, error) {
+func (c *Conn) roundTrip(ctx context.Context, body message.Body) (message.Header, message.Body, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	h.ConnectionID = c.connectionID
-	if !h.HasQueryID {
-		h.HasQueryID = true
-		h.ClientQueryID = c.nextQuery.Add(1)
+	h := message.Header{
+		ConnectionID:  c.connectionID,
+		HasQueryID:    true,
+		ClientQueryID: c.nextQuery.Add(1),
 	}
 	req, err := message.Encode(h, body)
 	if err != nil {
@@ -134,7 +132,7 @@ func (c *Conn) Close() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.transport.URI.Timeout)
 	defer cancel()
-	_, _, err := c.roundTrip(ctx, message.Header{}, message.DisconnectMessage{})
+	_, _, err := c.roundTrip(ctx,message.DisconnectMessage{})
 	if err == nil || errors.Is(err, context.Canceled) {
 		return nil
 	}
@@ -179,7 +177,7 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 	if err != nil {
 		return nil, err
 	}
-	_, body, err := c.roundTrip(ctx, message.Header{}, message.PrepareRequest{SQL: sql})
+	_, body, err := c.roundTrip(ctx,message.PrepareRequest{SQL: sql})
 	if err != nil {
 		return nil, err
 	}
@@ -196,7 +194,7 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 // through Exec; rows.go uses an interleaved iterator for QueryContext.
 func (c *Conn) drainResult(ctx context.Context, uuid codec.HugeInt) error {
 	for {
-		_, body, err := c.roundTrip(ctx, message.Header{}, message.FetchRequest{ResultUUID: uuid})
+		_, body, err := c.roundTrip(ctx,message.FetchRequest{ResultUUID: uuid})
 		if err != nil {
 			return err
 		}
@@ -216,7 +214,7 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	if err != nil {
 		return nil, err
 	}
-	_, body, err := c.roundTrip(ctx, message.Header{}, message.PrepareRequest{SQL: sql})
+	_, body, err := c.roundTrip(ctx,message.PrepareRequest{SQL: sql})
 	if err != nil {
 		return nil, err
 	}

@@ -1,6 +1,7 @@
 package quackdriver
 
 import (
+	"context"
 	"sync"
 	"testing"
 )
@@ -17,14 +18,14 @@ func TestConnClosedRace(t *testing.T) {
 	wg.Add(3)
 	go func() {
 		defer wg.Done()
-		for i := 0; i < N; i++ {
+		for range N {
 			_ = c.IsValid()
 		}
 	}()
 	go func() {
 		defer wg.Done()
-		for i := 0; i < N; i++ {
-			_ = c.ResetSession(nil)
+		for range N {
+			_ = c.ResetSession(context.TODO())
 		}
 	}()
 	go func() {

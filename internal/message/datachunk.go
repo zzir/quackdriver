@@ -17,6 +17,7 @@ var dateEpoch = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
 // VectorFormat enumerates DuckDB's vector encodings on the wire.
 type VectorFormat uint8
 
+// Vector encoding formats used on the DuckDB wire protocol.
 const (
 	VectorFlat       VectorFormat = 0
 	VectorFSST       VectorFormat = 1
@@ -58,9 +59,7 @@ func (iv IntervalValue) String() string {
 	if iv.Days != 0 {
 		parts = append(parts, plural(int(iv.Days), "day"))
 	}
-	if micros == 0 && len(parts) > 0 {
-		// pure months/days interval; no time component to render.
-	} else {
+	if micros != 0 || len(parts) == 0 {
 		// Saturate the magnitude before division. -MinInt64 wraps in two's
 		// complement, so handle that boundary explicitly.
 		switch {
@@ -113,7 +112,7 @@ type DataChunk struct {
 // Rows materializes the chunk as row-major slices of any.
 func (c *DataChunk) Rows() [][]any {
 	out := make([][]any, c.RowCount)
-	for i := 0; i < c.RowCount; i++ {
+	for i := range c.RowCount {
 		row := make([]any, len(c.Columns))
 		for col := range c.Columns {
 			row[col] = c.Columns[col][i]
@@ -727,7 +726,7 @@ func isValid(validity []bool, i int) bool {
 
 func decodeFixedValues(t logicaltype.Type, phys logicaltype.PhysicalType, raw []byte, count int, validity []bool) []any {
 	out := make([]any, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		if !isValid(validity, i) {
 			out[i] = nil
 			continue
@@ -927,7 +926,7 @@ func UUIDToBig(uuid string) (*big.Int, error) {
 		return nil, fmt.Errorf("message: UUID must have 32 hex digits, got %d", len(hex))
 	}
 	for _, c := range hex {
-		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return nil, fmt.Errorf("message: invalid UUID character %q", c)
 		}
 	}
@@ -953,7 +952,7 @@ func UUIDToBig(uuid string) (*big.Int, error) {
 
 func stripDashesLower(s string) string {
 	out := make([]byte, 0, len(s))
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		if c == '-' {
 			continue
@@ -1089,7 +1088,7 @@ func decodeInt64Logical(t logicaltype.Type, v int64) any {
 
 func decodeSequenceValues(t logicaltype.Type, start, increment int64, count int) ([]any, error) {
 	out := make([]any, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		raw := start + increment*int64(i)
 		switch t.ID {
 		case logicaltype.IDInteger:

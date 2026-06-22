@@ -75,9 +75,8 @@ func main() {
 		return d.(*quackdriver.Conn).Append(ctx, "enum_demo", cols, [][]any{{int32(99), "nope"}})
 	}); err == nil {
 		log.Fatal("expected error for unknown label, got nil")
-	} else {
-		fmt.Printf("unknown label correctly rejected: %v\n", err)
 	}
+	fmt.Printf("unknown label correctly rejected: %v\n", err)
 }
 
 func mustExec(ctx context.Context, db *sql.DB, q string) {

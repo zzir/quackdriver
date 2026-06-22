@@ -134,7 +134,7 @@ func ReleaseAll() {
 	registryMu.Unlock()
 
 	for _, s := range servers {
-		s.shutdown()
+		_ = s.shutdown()
 	}
 }
 
@@ -193,7 +193,7 @@ func (s *Server) shutdown() error {
 	}
 
 	if s.cmd != nil && s.cmd.Process != nil {
-		s.cmd.Process.Kill()
+		_ = s.cmd.Process.Kill()
 	}
 	<-s.done
 	return nil
@@ -204,7 +204,7 @@ func (s *Server) kill() {
 		s.stdin.Close()
 	}
 	if s.cmd != nil && s.cmd.Process != nil {
-		s.cmd.Process.Kill()
+		_ = s.cmd.Process.Kill()
 	}
 	<-s.done
 }
@@ -215,7 +215,7 @@ func pickFreePort() (int, error) {
 		return 0, fmt.Errorf("localserver: pick free port: %w", err)
 	}
 	port := l.Addr().(*net.TCPAddr).Port
-	l.Close()
+	_ = l.Close()
 	return port, nil
 }
 
@@ -233,7 +233,7 @@ func waitForReady(port int, timeout time.Duration) error {
 	for time.Now().Before(deadline) {
 		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
 		if err == nil {
-			conn.Close()
+			_ = conn.Close()
 			return nil
 		}
 		time.Sleep(250 * time.Millisecond)

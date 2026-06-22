@@ -96,7 +96,7 @@ func (c *Conn) AppendWithSchema(ctx context.Context, schema, table string, colum
 	}
 
 	chunk := message.DataChunk{RowCount: len(rows), Types: types, Columns: colData}
-	_, body, err := c.roundTrip(ctx, message.Header{}, message.AppendRequest{
+	_, body, err := c.roundTrip(ctx,message.AppendRequest{
 		SchemaName:  schema,
 		TableName:   table,
 		AppendChunk: chunk,
@@ -121,8 +121,7 @@ func convertAppendValue(t logicaltype.Type, v any) (any, error) {
 
 	switch t.ID {
 	case logicaltype.IDBoolean:
-		switch x := v.(type) {
-		case bool:
+		if x, ok := v.(bool); ok {
 			return x, nil
 		}
 		return nil, fmt.Errorf("BOOLEAN expects bool, got %T", v)

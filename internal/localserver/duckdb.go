@@ -77,12 +77,12 @@ func parseVersion(output string) (major, minor, patch int, err error) {
 	return major, minor, patch, nil
 }
 
-func versionAtLeast(major, minor, patch int, min [3]int) bool {
-	if major != min[0] {
-		return major > min[0]
+func versionAtLeast(major, minor, patch int, required [3]int) bool {
+	if major != required[0] {
+		return major > required[0]
 	}
-	if minor != min[1] {
-		return minor > min[1]
+	if minor != required[1] {
+		return minor > required[1]
 	}
-	return patch >= min[2]
+	return patch >= required[2]
 }
