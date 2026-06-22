@@ -15,6 +15,8 @@ package quackdriver
 import (
 	"database/sql"
 	"database/sql/driver"
+
+	"github.com/zzir/quackdriver/internal/localserver"
 )
 
 // driverName is the registered sql.Driver identifier.
@@ -41,4 +43,11 @@ func (Driver) Open(dsn string) (driver.Conn, error) {
 // OpenConnector parses a DSN and returns a reusable Connector.
 func (Driver) OpenConnector(dsn string) (driver.Connector, error) {
 	return newConnector(dsn)
+}
+
+// CloseLocalServers stops all auto-managed local DuckDB server processes.
+// Call this during application shutdown if using local-mode DSNs via
+// sql.Open (which does not expose the Connector for manual closing).
+func CloseLocalServers() {
+	localserver.ReleaseAll()
 }

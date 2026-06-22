@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"runtime"
 
+	"github.com/zzir/quackdriver/internal/localserver"
 	"github.com/zzir/quackdriver/internal/message"
 	"github.com/zzir/quackdriver/internal/transport"
 )
@@ -15,7 +16,8 @@ const clientVersion = "v1.5.3"
 
 // Connector is a parsed DSN that can produce new Conn values.
 type Connector struct {
-	uri *transport.URI
+	uri         *transport.URI
+	localServer *localserver.Server
 }
 
 func newConnector(dsn string) (*Connector, error) {
@@ -23,7 +25,28 @@ func newConnector(dsn string) (*Connector, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Connector{uri: u}, nil
+	c := &Connector{uri: u}
+	if u.IsLocal {
+		srv, err := localserver.Acquire(u.DBPath, u.Token, u.Timeout)
+		if err != nil {
+			return nil, err
+		}
+		u.Host = "127.0.0.1"
+		u.Port = srv.Port()
+		u.Token = srv.Token()
+		c.localServer = srv
+	}
+	return c, nil
+}
+
+// Close releases resources held by this Connector. For local-mode
+// Connectors, this decrements the local server's reference count and
+// may stop the DuckDB process.
+func (c *Connector) Close() error {
+	if c.localServer != nil {
+		return c.localServer.Release()
+	}
+	return nil
 }
 
 // Connect opens a Quack session by issuing a ConnectionRequest.

@@ -18,6 +18,23 @@ func TestParseURI(t *testing.T) {
 			Host: "fe80::1", Port: 1234, IPv6: true, SSL: true, Token: "abcd", Timeout: 5 * time.Second,
 		}},
 		{"quack://h?token=t", URI{Host: "h", Port: DefaultPort, Token: "t", Timeout: 30 * time.Second}},
+
+		// Local mode
+		{"quack://local/tmp/test.db?token=secret", URI{
+			Host: "127.0.0.1", IsLocal: true, DBPath: "/tmp/test.db", Token: "secret", Timeout: 30 * time.Second,
+		}},
+		{"quack://local/:memory:?token=auto", URI{
+			Host: "127.0.0.1", IsLocal: true, DBPath: "/:memory:", Token: "auto", Timeout: 30 * time.Second,
+		}},
+		{"quack://local?token=auto", URI{
+			Host: "127.0.0.1", IsLocal: true, Token: "auto", Timeout: 30 * time.Second,
+		}},
+		{"quack://local/?token=auto", URI{
+			Host: "127.0.0.1", IsLocal: true, DBPath: "/", Token: "auto", Timeout: 30 * time.Second,
+		}},
+		{"quack:local/path/to/data.duckdb?timeout=60s", URI{
+			Host: "127.0.0.1", IsLocal: true, DBPath: "/path/to/data.duckdb", Timeout: 60 * time.Second,
+		}},
 	}
 	for _, c := range cases {
 		got, err := ParseURI(c.dsn)
@@ -42,6 +59,7 @@ func TestParseURIErrors(t *testing.T) {
 		"quack:[::1",
 		"quack://h?tls=maybe",
 		"quack://h?timeout=oops",
+		"quack://local/tmp/test.db?tls=true", // local mode rejects TLS
 	}
 	for _, dsn := range cases {
 		if _, err := ParseURI(dsn); err == nil {

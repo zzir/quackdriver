@@ -26,6 +26,9 @@ type URI struct {
 	SSL     bool
 	Token   string
 	Timeout time.Duration
+
+	IsLocal bool   // auto-manage a local DuckDB process
+	DBPath  string // database file path; empty or ":memory:" for in-memory
 }
 
 // ParseURI parses a Quack DSN. Accepted forms:
@@ -67,6 +70,30 @@ func ParseURI(dsn string) (*URI, error) {
 		rawQuery = rest[idx+1:]
 		rest = rest[:idx]
 	}
+
+	// Detect local mode: "local", "local/path", "local/:memory:" etc.
+	isLocal := rest == "local" || strings.HasPrefix(rest, "local/")
+	if isLocal {
+		dbPath := ""
+		if strings.HasPrefix(rest, "local/") {
+			dbPath = rest[len("local"):]
+		}
+		out := &URI{
+			Host:    "127.0.0.1",
+			Port:    0,
+			IsLocal: true,
+			DBPath:  dbPath,
+			Timeout: 30 * time.Second,
+		}
+		if err := parseQuery(out, rawQuery); err != nil {
+			return nil, err
+		}
+		if out.SSL {
+			return nil, fmt.Errorf("transport: tls is not supported for local mode")
+		}
+		return out, nil
+	}
+
 	// Drop any path component (Quack DSNs don't use them, but some users may
 	// add a trailing slash).
 	if idx := strings.Index(rest, "/"); idx >= 0 {
@@ -113,30 +140,38 @@ func ParseURI(dsn string) (*URI, error) {
 		return nil, fmt.Errorf("transport: port %d out of range", out.Port)
 	}
 
-	if rawQuery != "" {
-		q, err := url.ParseQuery(rawQuery)
-		if err != nil {
-			return nil, fmt.Errorf("transport: invalid query string: %w", err)
-		}
-		if v := q.Get("token"); v != "" {
-			out.Token = v
-		}
-		if v := q.Get("tls"); v != "" {
-			ssl, err := strconv.ParseBool(v)
-			if err != nil {
-				return nil, fmt.Errorf("transport: invalid tls=%q", v)
-			}
-			out.SSL = ssl
-		}
-		if v := q.Get("timeout"); v != "" {
-			d, err := time.ParseDuration(v)
-			if err != nil {
-				return nil, fmt.Errorf("transport: invalid timeout=%q", v)
-			}
-			out.Timeout = d
-		}
+	if err := parseQuery(out, rawQuery); err != nil {
+		return nil, err
 	}
 	return out, nil
+}
+
+func parseQuery(out *URI, rawQuery string) error {
+	if rawQuery == "" {
+		return nil
+	}
+	q, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return fmt.Errorf("transport: invalid query string: %w", err)
+	}
+	if v := q.Get("token"); v != "" {
+		out.Token = v
+	}
+	if v := q.Get("tls"); v != "" {
+		ssl, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("transport: invalid tls=%q", v)
+		}
+		out.SSL = ssl
+	}
+	if v := q.Get("timeout"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("transport: invalid timeout=%q", v)
+		}
+		out.Timeout = d
+	}
+	return nil
 }
 
 // HTTPURL returns the http(s)://host:port URL used by the HTTP client.
