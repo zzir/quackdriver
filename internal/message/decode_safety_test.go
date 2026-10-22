@@ -1,116 +1,116 @@
 package message
 
 import (
-	"strings"
+	"math/big"
 	"testing"
 
 	"github.com/zzir/quackdriver/internal/codec"
 	"github.com/zzir/quackdriver/internal/logicaltype"
 )
 
-// buildVarcharChunk produces an on-wire DataChunk wrapper with `claimed`
-// rows declared in the header but only `actual` VARCHAR slots transmitted.
-// A correct decoder must reject the mismatch instead of panicking when it
-// later indexes off the end of the values slice.
-func buildVarcharChunk(t *testing.T, claimed, actual int) []byte {
-	t.Helper()
-	w := codec.NewWriter()
-	w.WriteObject(func(w *codec.Writer) {
-		w.WriteField(300, func(w *codec.Writer) {
-			w.WriteObject(func(w *codec.Writer) {
-				w.WriteField(100, func(w *codec.Writer) { w.WriteULEB128(uint64(claimed)) })
-				w.WriteField(101, func(w *codec.Writer) {
-					w.WriteULEB128(1)
-					logicaltype.Encode(w, logicaltype.Type{ID: logicaltype.IDVarchar})
-				})
-				w.WriteField(102, func(w *codec.Writer) {
-					w.WriteULEB128(1) // one column
-					w.WriteObject(func(w *codec.Writer) {
-						w.WriteField(100, func(w *codec.Writer) { w.WriteBool(false) }) // no validity
-						w.WriteField(102, func(w *codec.Writer) {
-							w.WriteULEB128(uint64(actual))
-							for range actual {
-								w.WriteBlob([]byte("x"))
-							}
-						})
-					})
-				})
-			})
-		})
-	})
-	return w.Bytes()
+// safetyCorpus returns one well-formed encoding of every message type,
+// including chunk-carrying ones, used to derive malformed inputs.
+func safetyCorpus(tb testing.TB) map[string][]byte {
+	tb.Helper()
+	chunk := DataChunk{
+		RowCount: 2,
+		Types:    []logicaltype.Type{{ID: logicaltype.IDInteger}, {ID: logicaltype.IDVarchar}},
+		Columns:  []Column{Values{int32(1), nil}, Values{"a", "bc"}},
+	}
+	nested := vectorCorpusChunk()
+	bodies := map[string]struct {
+		h Header
+		b Body
+	}{
+		"connreq":   {Header{}, ConnectionRequest{AuthString: "t", ClientDuckdbVersion: "v2.0.0", ClientPlatform: "go", MinSupportedQuackVersion: 3, MaxSupportedQuackVersion: 3, ClientID: "abcd", HeartbeatTimeoutSeconds: 60}},
+		"connresp":  {Header{ConnectionID: "c", HasQueryID: true, ClientQueryID: 1}, ConnectionResponse{ServerDuckdbVersion: "v2.0.0", ServerPlatform: "p", QuackVersion: 3, HeartbeatTimeoutSeconds: 60}},
+		"prepreq":   {Header{ConnectionID: "c"}, PrepareRequest{SQL: "SELECT 1", QueryUUID: codec.HugeInt{Upper: 3, Lower: 4}, InlineRows: Idx(0)}},
+		"prepresp":  {Header{}, PrepareResponse{ResultTypes: chunk.Types, ResultNames: []string{"i", "s"}, NeedsMoreFetch: true, Results: []DataChunk{chunk}, QueryUUID: codec.HugeInt{Lower: 1}}},
+		"fetchreq":  {Header{}, FetchRequest{QueryUUID: codec.HugeInt{Lower: 1}, BatchIndex: 2, AckIndex: 1}},
+		"fetchresp": {Header{}, FetchResponse{Results: []DataChunk{chunk, chunk}, BatchIndex: Idx(2)}},
+		"vectors":   {Header{}, FetchResponse{Results: []DataChunk{nested}, BatchIndex: Idx(1)}},
+		"senddata":  {Header{ConnectionID: "c"}, SendDataRequest{StreamID: "s", Chunks: []DataChunk{chunk}, BatchIndex: Idx(1)}},
+		"sendresp":  {Header{}, SendDataResponse{}},
+		"cancel":    {Header{}, CancelRequest{QueryUUID: codec.HugeInt{Lower: 1}}},
+		"ack":       {Header{}, Acknowledgement{QueryUUID: codec.HugeInt{Lower: 1}}},
+		"hb":        {Header{ConnectionID: "c"}, HeartbeatRequest{}},
+		"success":   {Header{}, SuccessResponse{}},
+		"disc":      {Header{}, DisconnectMessage{}},
+		"error":     {Header{}, ErrorResponse{Message: "m", ExceptionType: "Catalog", ExtraInfo: map[string]string{"k": "v"}, MustInvalidate: true}},
+	}
+	out := make(map[string][]byte, len(bodies))
+	for name, m := range bodies {
+		buf, err := Encode(m.h, m.b)
+		if err != nil {
+			tb.Fatalf("%s: encode: %v", name, err)
+		}
+		out[name] = buf
+	}
+	return out
 }
 
-func TestDecodeVarcharLengthMismatchRejected(t *testing.T) {
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("decoder panicked on length mismatch: %v", r)
-		}
+func decodeNoPanic(t *testing.T, label string, raw []byte) error {
+	t.Helper()
+	var err error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("%s: Decode panicked: %v\nbytes: % x", label, r, raw)
+			}
+		}()
+		_, _, err = Decode(raw)
 	}()
+	return err
+}
 
-	raw := buildVarcharChunk(t, 5 /*claimed*/, 2 /*actual*/)
-	r := codec.NewReader(raw)
-	if _, err := decodeDataChunkWrapper(r); err == nil {
-		t.Fatal("expected error for VARCHAR row count mismatch, got nil")
-	} else if !strings.Contains(err.Error(), "VARCHAR vector") {
-		t.Fatalf("error should mention VARCHAR vector: %v", err)
+// TestDecodeMalformedNeverPanics: every strict prefix of a valid message is
+// an error, and no single-byte change or deletion makes Decode panic.
+func TestDecodeMalformedNeverPanics(t *testing.T) {
+	for name, full := range safetyCorpus(t) {
+		if err := decodeNoPanic(t, name, full); err != nil {
+			t.Fatalf("%s: corpus entry does not decode: %v", name, err)
+		}
+		for i := range full {
+			if err := decodeNoPanic(t, name, full[:i]); err == nil {
+				t.Errorf("%s: %d-byte prefix decoded without error", name, i)
+			}
+			for _, v := range []byte{0x00, 0x01, 0x02, 0x7f, 0x80, 0xfe, 0xff} {
+				mutated := append([]byte(nil), full...)
+				mutated[i] = v
+				_ = decodeNoPanic(t, name, mutated)
+			}
+			_ = decodeNoPanic(t, name, append(append([]byte(nil), full[:i]...), full[i+1:]...))
+		}
 	}
 }
 
-// buildListChunkBadOffset constructs a one-row LIST<INTEGER> chunk where the
-// list-entry's (offset, length) extends past the child-vector buffer. A safe
-// decoder must reject this rather than panic on slice out of range.
-func buildListChunkBadOffset(t *testing.T) []byte {
-	t.Helper()
-	w := codec.NewWriter()
-	w.WriteObject(func(w *codec.Writer) {
-		w.WriteField(300, func(w *codec.Writer) {
-			w.WriteObject(func(w *codec.Writer) {
-				w.WriteField(100, func(w *codec.Writer) { w.WriteULEB128(1) }) // row_count = 1
-				child := logicaltype.Type{ID: logicaltype.IDInteger}
-				listType := logicaltype.Type{
-					ID:   logicaltype.IDList,
-					Info: &logicaltype.ExtraInfo{Kind: logicaltype.ExtraList, Child: &child},
-				}
-				w.WriteField(101, func(w *codec.Writer) {
-					w.WriteULEB128(1)
-					logicaltype.Encode(w, listType)
-				})
-				w.WriteField(102, func(w *codec.Writer) {
-					w.WriteULEB128(1)
-					w.WriteObject(func(w *codec.Writer) {
-						w.WriteField(100, func(w *codec.Writer) { w.WriteBool(false) }) // no validity
-						w.WriteField(104, func(w *codec.Writer) { w.WriteULEB128(0) })   // child size 0
-						w.WriteField(105, func(w *codec.Writer) {
-							w.WriteULEB128(1)
-							w.WriteObject(func(w *codec.Writer) {
-								w.WriteField(100, func(w *codec.Writer) { w.WriteULEB128(0) })   // offset 0
-								w.WriteField(101, func(w *codec.Writer) { w.WriteULEB128(99) })  // length 99 — out of range
-							})
-						})
-						w.WriteField(106, func(w *codec.Writer) {
-							encodeFlatVector(w, child, []any{}, 0) // empty child vector
-						})
-					})
-				})
-			})
-		})
-	})
-	return w.Bytes()
-}
-
-func TestDecodeListBadEntryRejected(t *testing.T) {
-	defer func() {
-		if r := recover(); r != nil {
-			t.Fatalf("decoder panicked on out-of-range LIST entry: %v", r)
-		}
-	}()
-
-	raw := buildListChunkBadOffset(t)
-	r := codec.NewReader(raw)
-	if _, err := decodeDataChunkWrapper(r); err == nil {
-		t.Fatal("expected error for LIST entry exceeding child vector, got nil")
-	} else if !strings.Contains(err.Error(), "LIST entry") {
-		t.Fatalf("error should mention LIST entry: %v", err)
+// vectorCorpusChunk is a chunk exercising every vector code path the encoder
+// writes: strings (2.0 layout), nested types, wide fixed-size types and
+// NULLs at every level.
+func vectorCorpusChunk() DataChunk {
+	types := []logicaltype.Type{
+		listOf(tp(logicaltype.IDVarchar)),
+		structOf(logicaltype.IDStruct, field("a", tp(logicaltype.IDInteger)), field("b", tp(logicaltype.IDBlob))),
+		decimalOf(20, 4),
+		tp(logicaltype.IDUUID),
+		tp(logicaltype.IDBit),
+		mapOf(tp(logicaltype.IDVarchar), tp(logicaltype.IDBignum)),
+		arrayOf(tp(logicaltype.IDSmallint), 2),
+		unionOf(field("i", tp(logicaltype.IDInteger)), field("s", tp(logicaltype.IDVarchar))),
+		tp(logicaltype.IDGeometry),
+		enumOf("x", "y"),
 	}
+	cols := []Column{
+		Values{[]any{"a", nil, ""}, nil},
+		Values{map[string]any{"a": int32(1), "b": []byte{1}}, nil},
+		Values{"-1.2345", nil},
+		Values{"550e8400-e29b-41d4-a716-446655440000", nil},
+		Values{"0110", nil},
+		Values{[]any{map[string]any{"key": "k", "value": big.NewInt(-300)}}, nil},
+		Values{[]any{int16(1), nil}, nil},
+		Values{map[string]any{"s": "u"}, nil},
+		Values{[]byte{1, 2}, nil},
+		Values{"y", nil},
+	}
+	return DataChunk{RowCount: 2, Types: types, Columns: cols}
 }
