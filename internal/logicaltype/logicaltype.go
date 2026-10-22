@@ -6,6 +6,7 @@ package logicaltype
 import (
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/zzir/quackdriver/internal/codec"
 )
@@ -13,7 +14,8 @@ import (
 // ID enumerates DuckDB logical type ids serialized in Quack result schemas.
 type ID uint32
 
-// Logical type ids. Values match DuckDB's `LogicalTypeId` enum.
+// Logical type ids. Values match DuckDB's `LogicalTypeId` enum (DuckDB
+// v2.0.0, src/include/duckdb/common/types.hpp).
 const (
 	IDInvalid        ID = 0
 	IDSQLNull        ID = 1
@@ -45,6 +47,7 @@ const (
 	IDUInteger       ID = 30
 	IDUBigint        ID = 31
 	IDTimestampTz    ID = 32
+	IDTimestampTzNs  ID = 33 // TIMESTAMP_TZ_NS: INT64 nanoseconds since the epoch, UTC
 	IDTimeTz         ID = 34
 	IDTimeNs         ID = 35
 	IDBit            ID = 36
@@ -62,11 +65,17 @@ const (
 	IDMap            ID = 102
 	IDTable          ID = 103
 	IDEnum           ID = 104
+	// IDAggregateState is LEGACY_AGGREGATE_STATE in DuckDB 2.0. DuckDB's reader
+	// turns it into BLOB; 2.0 itself represents aggregate states as ordinary
+	// types carrying an AGGREGATE_STATE alias, so a 2.0 server does not send it.
 	IDAggregateState ID = 105
 	IDLambda         ID = 106
 	IDUnion          ID = 107
 	IDArray          ID = 108
 	IDVariant        ID = 109
+	// IDTuple is an unnamed STRUCT: STRUCT_TYPE_INFO whose children all have
+	// empty names, physically a STRUCT. row(...) and (a, b) produce it.
+	IDTuple ID = 110
 )
 
 // PhysicalType enumerates DuckDB's physical storage tags.
@@ -100,22 +109,23 @@ const (
 // ExtraInfoType discriminates ExtraTypeInfo variants.
 type ExtraInfoType uint32
 
-// ExtraTypeInfo discriminator values. Values match DuckDB's `ExtraTypeInfoType`.
+// ExtraTypeInfo discriminator values. Values match DuckDB's `LogicalTypeInfoType`
+// (called ExtraTypeInfoType before 2.0; the numbering did not change).
 const (
-	ExtraInvalid         ExtraInfoType = 0
-	ExtraGeneric         ExtraInfoType = 1
-	ExtraDecimal         ExtraInfoType = 2
-	ExtraString          ExtraInfoType = 3
-	ExtraList            ExtraInfoType = 4
-	ExtraStruct          ExtraInfoType = 5
-	ExtraEnum            ExtraInfoType = 6
-	ExtraUnbound         ExtraInfoType = 7
-	ExtraAggregateState  ExtraInfoType = 8
-	ExtraArray           ExtraInfoType = 9
-	ExtraAny             ExtraInfoType = 10
-	ExtraIntegerLiteral  ExtraInfoType = 11
-	ExtraTemplate        ExtraInfoType = 12
-	ExtraGeo             ExtraInfoType = 13
+	ExtraInvalid        ExtraInfoType = 0
+	ExtraGeneric        ExtraInfoType = 1
+	ExtraDecimal        ExtraInfoType = 2
+	ExtraString         ExtraInfoType = 3
+	ExtraList           ExtraInfoType = 4
+	ExtraStruct         ExtraInfoType = 5
+	ExtraEnum           ExtraInfoType = 6
+	ExtraUnbound        ExtraInfoType = 7
+	ExtraAggregateState ExtraInfoType = 8 // LEGACY_AGGREGATE_STATE_TYPE_INFO in 2.0
+	ExtraArray          ExtraInfoType = 9
+	ExtraAny            ExtraInfoType = 10
+	ExtraIntegerLiteral ExtraInfoType = 11
+	ExtraTemplate       ExtraInfoType = 12
+	ExtraGeo            ExtraInfoType = 13
 )
 
 // ErrUnsupported indicates a logical-type variant the driver does not implement yet.
@@ -152,7 +162,7 @@ type ExtraInfo struct {
 	// ENUM
 	EnumValues []string
 
-	// AGGREGATE_STATE
+	// LEGACY_AGGREGATE_STATE (decoded when present; DuckDB 2.0 writes none of these)
 	FunctionName       string
 	ReturnType         *Type
 	BoundArgumentTypes []Type
@@ -171,12 +181,36 @@ type ExtraInfo struct {
 
 	// GEO
 	CRSDefinition string
+
+	// ExtensionInfo is the serialized ExtensionTypeInfo object (field 103),
+	// kept verbatim; nil when the type has none. See extension.go.
+	ExtensionInfo []byte
 }
 
 // Type is a DuckDB logical type plus optional ExtraInfo metadata.
 type Type struct {
-	ID    ID
-	Info  *ExtraInfo
+	ID   ID
+	Info *ExtraInfo
+}
+
+// Contains reports whether t, or a type nested in it (a LIST, ARRAY or MAP
+// child, a STRUCT, TUPLE or UNION member), has the given id.
+func (t Type) Contains(id ID) bool {
+	if t.ID == id {
+		return true
+	}
+	if t.Info == nil {
+		return false
+	}
+	if t.Info.Child != nil && t.Info.Child.Contains(id) {
+		return true
+	}
+	for _, c := range t.Info.Children {
+		if c.Type.Contains(id) {
+			return true
+		}
+	}
+	return false
 }
 
 // PhysicalType returns the storage tag used by Vector encodings for this type.
@@ -196,7 +230,8 @@ func (t Type) PhysicalType() PhysicalType {
 		return PhysicalInt32
 	case IDUInteger:
 		return PhysicalUint32
-	case IDBigint, IDTime, IDTimeNs, IDTimestamp, IDTimestampSec, IDTimestampNs, IDTimestampMs, IDTimeTz, IDTimestampTz:
+	case IDBigint, IDTime, IDTimeNs, IDTimestamp, IDTimestampSec, IDTimestampNs, IDTimestampMs, IDTimeTz,
+		IDTimestampTz, IDTimestampTzNs:
 		return PhysicalInt64
 	case IDUBigint:
 		return PhysicalUint64
@@ -214,7 +249,7 @@ func (t Type) PhysicalType() PhysicalType {
 		return PhysicalVarchar
 	case IDInterval:
 		return PhysicalInterval
-	case IDUnion, IDVariant, IDStruct:
+	case IDUnion, IDVariant, IDStruct, IDTuple:
 		return PhysicalStruct
 	case IDList, IDMap:
 		return PhysicalList
@@ -232,13 +267,8 @@ func (t Type) PhysicalType() PhysicalType {
 
 // IsFixedSize reports whether a physical type has fixed-width values.
 func IsFixedSize(p PhysicalType) bool {
-	switch p {
-	case PhysicalBool, PhysicalUint8, PhysicalInt8, PhysicalUint16, PhysicalInt16,
-		PhysicalUint32, PhysicalInt32, PhysicalUint64, PhysicalInt64,
-		PhysicalFloat, PhysicalDouble, PhysicalInterval, PhysicalUint128, PhysicalInt128:
-		return true
-	}
-	return false
+	_, err := FixedSize(p)
+	return err == nil
 }
 
 // FixedSize returns the byte width for a fixed-size physical type.
@@ -289,7 +319,14 @@ func enumPhysical(t Type) PhysicalType {
 	return PhysicalUint32
 }
 
-// Encode writes a LogicalType to w.
+// maxDepth bounds type nesting on decode so a hostile payload cannot exhaust
+// the goroutine stack. Real schemas nest a handful of levels.
+const maxDepth = 256
+
+// Encode writes a LogicalType to w the way DuckDB 2.0's LogicalType::Serialize
+// does at StorageVersion::V2_0_0: field 100 id, then field 101 nullable type
+// info only when Info is non-nil. Properties DuckDB writes "with default" are
+// omitted when they hold their default value, so the bytes match DuckDB's.
 func Encode(w *codec.Writer, t Type) {
 	w.WriteObject(func(w *codec.Writer) {
 		w.WriteField(100, func(w *codec.Writer) { w.WriteULEB128(uint64(t.ID)) })
@@ -302,142 +339,205 @@ func Encode(w *codec.Writer, t Type) {
 	})
 }
 
-// Decode reads a LogicalType from r.
+// Decode reads a LogicalType from r. Like DuckDB's reader it rejects type
+// info that does not belong to the type id and DECIMAL widths/scales DuckDB
+// considers invalid.
 func Decode(r *codec.Reader) (Type, error) {
+	return decodeType(r, 0)
+}
+
+func decodeType(r *codec.Reader, depth int) (Type, error) {
+	if depth > maxDepth {
+		return Type{}, fmt.Errorf("logicaltype: type nesting exceeds %d levels", maxDepth)
+	}
 	var out Type
 	err := r.ReadObject(func(r *codec.Reader) error {
-		if err := r.ReadRequiredField(100, func(r *codec.Reader) error {
-			id, err := r.ReadULEB128()
-			if err != nil {
-				return err
-			}
-			out.ID = ID(id)
-			return nil
+		var id uint64
+		if err := r.ReadRequiredField(100, func(r *codec.Reader) (err error) {
+			id, err = r.ReadULEB128()
+			return err
 		}); err != nil {
 			return err
 		}
+		if id > math.MaxUint8 {
+			return fmt.Errorf("logicaltype: type id %d out of range", id)
+		}
+		out.ID = ID(id)
 		_, err := r.ReadOptionalField(101, func(r *codec.Reader) error {
 			present, err := r.ReadBool()
-			if err != nil {
+			if err != nil || !present {
 				return err
 			}
-			if !present {
-				return nil
-			}
-			info, err := decodeExtra(r)
-			if err != nil {
-				return err
-			}
-			out.Info = info
-			return nil
+			out.Info, err = decodeExtra(r, depth)
+			return err
 		})
 		return err
 	})
-	return out, err
+	if err == nil {
+		err = validate(out)
+	}
+	if err != nil {
+		return Type{}, err
+	}
+	return out, nil
 }
 
+// validate mirrors the checks in DuckDB 2.0's LogicalType::Deserialize.
+func validate(t Type) error {
+	if t.Info == nil {
+		return nil
+	}
+	kind := t.Info.Kind
+	if kind == ExtraInvalid || kind == ExtraGeneric {
+		return nil
+	}
+	if t.ID == IDAggregateState {
+		// DuckDB converts LEGACY_AGGREGATE_STATE to BLOB before checking.
+		return nil
+	}
+	if want, ok := infoKindFor(t.ID); !ok || want != kind {
+		return fmt.Errorf("logicaltype: type info kind %d does not match type %s", kind, t.Name())
+	}
+	if kind == ExtraDecimal && (t.Info.Width < 1 || t.Info.Width > MaxDecimalWidth || t.Info.Scale > t.Info.Width) {
+		return fmt.Errorf("logicaltype: invalid DECIMAL(%d, %d)", t.Info.Width, t.Info.Scale)
+	}
+	return nil
+}
+
+// MaxDecimalWidth is DuckDB's Decimal::MAX_WIDTH_DECIMAL.
+const MaxDecimalWidth = 38
+
+// infoKindFor returns the only non-generic type info kind a type id accepts
+// (DuckDB's LogicalType::HasParameters).
+func infoKindFor(id ID) (ExtraInfoType, bool) {
+	switch id {
+	case IDList, IDMap:
+		return ExtraList, true
+	case IDStruct, IDTuple, IDUnion, IDVariant:
+		return ExtraStruct, true
+	case IDArray:
+		return ExtraArray, true
+	case IDDecimal:
+		return ExtraDecimal, true
+	case IDEnum:
+		return ExtraEnum, true
+	case IDVarchar:
+		return ExtraString, true
+	case IDAny:
+		return ExtraAny, true
+	case IDIntegerLiteral:
+		return ExtraIntegerLiteral, true
+	case IDTemplate:
+		return ExtraTemplate, true
+	case IDGeometry:
+		return ExtraGeo, true
+	case IDUnbound:
+		return ExtraUnbound, true
+	}
+	return 0, false
+}
+
+// encodeExtra writes a LogicalTypeInfo object following DuckDB 2.0's
+// generated serialize_types.cpp (R = always written, D = written only when
+// not the default).
 func encodeExtra(w *codec.Writer, info *ExtraInfo) {
 	w.WriteObject(func(w *codec.Writer) {
-		w.WriteField(100, func(w *codec.Writer) { w.WriteULEB128(uint64(info.Kind)) })
-		if info.Alias != "" {
-			w.WriteField(101, func(w *codec.Writer) { w.WriteString(info.Alias) })
+		w.WriteField(100, func(w *codec.Writer) { w.WriteULEB128(uint64(info.Kind)) }) // R
+		w.WriteStringWithDefault(101, info.Alias)                                      // D
+		if info.ExtensionInfo != nil {                                                 // D (nullable)
+			w.WriteField(103, func(w *codec.Writer) {
+				w.WriteBool(true)
+				w.WriteBytes(info.ExtensionInfo)
+			})
 		}
 		switch info.Kind {
 		case ExtraInvalid, ExtraGeneric:
 		case ExtraDecimal:
-			w.WriteField(200, func(w *codec.Writer) { w.WriteULEB128(uint64(info.Width)) })
-			w.WriteField(201, func(w *codec.Writer) { w.WriteULEB128(uint64(info.Scale)) })
+			w.WriteUintWithDefault(200, uint64(info.Width)) // D
+			w.WriteUintWithDefault(201, uint64(info.Scale)) // D
 		case ExtraString:
-			w.WriteField(200, func(w *codec.Writer) { w.WriteString(info.Collation) })
+			w.WriteStringWithDefault(200, info.Collation) // D
 		case ExtraList:
-			if info.Child != nil {
+			if info.Child != nil { // R in DuckDB; a nil child cannot be represented
 				w.WriteField(200, func(w *codec.Writer) { Encode(w, *info.Child) })
 			}
 		case ExtraStruct:
-			w.WriteField(200, func(w *codec.Writer) { encodeChildren(w, info.Children) })
+			if len(info.Children) > 0 { // D
+				w.WriteField(200, func(w *codec.Writer) { encodeChildren(w, info.Children) })
+			}
 		case ExtraEnum:
-			w.WriteField(200, func(w *codec.Writer) { w.WriteULEB128(uint64(len(info.EnumValues))) })
-			w.WriteField(201, func(w *codec.Writer) {
+			w.WriteField(200, func(w *codec.Writer) { w.WriteULEB128(uint64(len(info.EnumValues))) }) // R
+			w.WriteField(201, func(w *codec.Writer) {                                                 // R
 				w.WriteULEB128(uint64(len(info.EnumValues)))
 				for _, v := range info.EnumValues {
 					w.WriteString(v)
 				}
 			})
 		case ExtraAggregateState:
-			w.WriteField(200, func(w *codec.Writer) { w.WriteString(info.FunctionName) })
-			if info.ReturnType != nil {
-				w.WriteField(201, func(w *codec.Writer) { Encode(w, *info.ReturnType) })
-			}
-			w.WriteField(202, func(w *codec.Writer) {
-				w.WriteULEB128(uint64(len(info.BoundArgumentTypes)))
-				for _, t := range info.BoundArgumentTypes {
-					Encode(w, t)
-				}
-			})
+			// LEGACY_AGGREGATE_STATE_TYPE_INFO: all of its properties were deleted in 2.0.
 		case ExtraArray:
-			if info.Child != nil {
+			if info.Child != nil { // R
 				w.WriteField(200, func(w *codec.Writer) { Encode(w, *info.Child) })
 			}
-			w.WriteField(201, func(w *codec.Writer) { w.WriteULEB128(uint64(info.ArraySize)) })
+			w.WriteUintWithDefault(201, uint64(info.ArraySize)) // D
 		case ExtraAny:
-			if info.TargetType != nil {
+			if info.TargetType != nil { // R
 				w.WriteField(200, func(w *codec.Writer) { Encode(w, *info.TargetType) })
 			}
-			w.WriteField(201, func(w *codec.Writer) { w.WriteULEB128(info.CastScore) })
+			w.WriteUintWithDefault(201, info.CastScore) // D
 		case ExtraTemplate:
-			w.WriteField(200, func(w *codec.Writer) { w.WriteString(info.TemplateName) })
+			w.WriteStringWithDefault(200, info.TemplateName) // D
 		case ExtraGeo:
-			w.WriteField(200, func(w *codec.Writer) {
+			w.WriteField(200, func(w *codec.Writer) { // R: CoordinateReferenceSystem object
 				w.WriteObject(func(w *codec.Writer) {
-					if info.CRSDefinition != "" {
-						w.WriteField(100, func(w *codec.Writer) { w.WriteString(info.CRSDefinition) })
-					}
+					w.WriteStringWithDefault(100, info.CRSDefinition) // D
 				})
 			})
 		case ExtraUnbound:
-			if info.UnboundName != "" {
-				w.WriteField(200, func(w *codec.Writer) { w.WriteString(info.UnboundName) })
-			}
-			if info.UnboundCatalog != "" {
-				w.WriteField(201, func(w *codec.Writer) { w.WriteString(info.UnboundCatalog) })
-			}
-			if info.UnboundSchema != "" {
-				w.WriteField(202, func(w *codec.Writer) { w.WriteString(info.UnboundSchema) })
-			}
+			w.WriteStringWithDefault(200, info.UnboundName)
+			w.WriteStringWithDefault(201, info.UnboundCatalog)
+			w.WriteStringWithDefault(202, info.UnboundSchema)
 		}
 	})
 }
 
-func decodeExtra(r *codec.Reader) (*ExtraInfo, error) {
+func decodeExtra(r *codec.Reader, depth int) (*ExtraInfo, error) {
 	info := &ExtraInfo{}
+	// typeField reads a LogicalType property into *dst.
+	typeField := func(dst **Type) func(*codec.Reader) error {
+		return func(r *codec.Reader) error {
+			t, err := decodeType(r, depth+1)
+			*dst = &t
+			return err
+		}
+	}
 	err := r.ReadObject(func(r *codec.Reader) error {
-		if err := r.ReadRequiredField(100, func(r *codec.Reader) error {
-			v, err := r.ReadULEB128()
-			if err != nil {
-				return err
-			}
-			info.Kind = ExtraInfoType(v)
-			return nil
-		}); err != nil {
-			return err
-		}
-		if _, err := r.ReadOptionalField(101, func(r *codec.Reader) error {
-			v, err := r.ReadString()
-			info.Alias = v
+		var kind uint64
+		if err := r.ReadRequiredField(100, func(r *codec.Reader) (err error) {
+			kind, err = r.ReadULEB128()
 			return err
 		}); err != nil {
 			return err
 		}
-		// Skip future extension-marker field at 103 if present.
+		if kind > math.MaxUint8 {
+			return fmt.Errorf("logicaltype: type info kind %d out of range", kind)
+		}
+		info.Kind = ExtraInfoType(kind)
+		if err := r.ReadStringWithDefault(101, &info.Alias); err != nil {
+			return err
+		}
+		// 102 (modifiers) is a deleted property holding Values; DuckDB 2.0
+		// never writes it.
+		if id, err := r.PeekFieldID(); err == nil && id == 102 {
+			return fmt.Errorf("logicaltype: legacy type modifiers: %w", ErrUnsupported)
+		}
 		if _, err := r.ReadOptionalField(103, func(r *codec.Reader) error {
 			present, err := r.ReadBool()
-			if err != nil {
+			if err != nil || !present {
 				return err
 			}
-			if present {
-				return fmt.Errorf("logicaltype: extension type metadata: %w", ErrUnsupported)
-			}
-			return nil
+			info.ExtensionInfo, err = readExtensionInfo(r, depth)
+			return err
 		}); err != nil {
 			return err
 		}
@@ -446,196 +546,119 @@ func decodeExtra(r *codec.Reader) (*ExtraInfo, error) {
 		case ExtraInvalid, ExtraGeneric:
 			return nil
 		case ExtraDecimal:
-			if _, err := r.ReadOptionalField(200, func(r *codec.Reader) error {
-				v, err := r.ReadULEB128()
-				info.Width = uint8(v)
-				return err
-			}); err != nil {
+			var width, scale uint64
+			if err := r.ReadUintWithDefault(200, &width); err != nil {
 				return err
 			}
-			if _, err := r.ReadOptionalField(201, func(r *codec.Reader) error {
-				v, err := r.ReadULEB128()
-				info.Scale = uint8(v)
-				return err
-			}); err != nil {
+			if err := r.ReadUintWithDefault(201, &scale); err != nil {
 				return err
 			}
+			if width > math.MaxUint8 || scale > math.MaxUint8 {
+				return fmt.Errorf("logicaltype: DECIMAL(%d, %d) out of range", width, scale)
+			}
+			info.Width, info.Scale = uint8(width), uint8(scale)
 			return nil
 		case ExtraString:
-			if _, err := r.ReadOptionalField(200, func(r *codec.Reader) error {
-				v, err := r.ReadString()
-				info.Collation = v
-				return err
-			}); err != nil {
-				return err
-			}
-			return nil
+			return r.ReadStringWithDefault(200, &info.Collation)
 		case ExtraList:
-			return r.ReadRequiredField(200, func(r *codec.Reader) error {
-				child, err := Decode(r)
-				if err != nil {
-					return err
-				}
-				info.Child = &child
-				return nil
-			})
+			return r.ReadRequiredField(200, typeField(&info.Child))
 		case ExtraStruct:
-			if _, err := r.ReadOptionalField(200, func(r *codec.Reader) error {
-				children, err := decodeChildren(r)
-				if err != nil {
-					return err
-				}
-				info.Children = children
-				return nil
-			}); err != nil {
+			_, err := r.ReadOptionalField(200, func(r *codec.Reader) (err error) {
+				info.Children, err = decodeChildren(r, depth)
 				return err
-			}
-			return nil
+			})
+			return err
 		case ExtraEnum:
-			if err := r.ReadRequiredField(200, func(r *codec.Reader) error {
-				_, err := r.ReadULEB128()
+			var count uint64
+			if err := r.ReadRequiredField(200, func(r *codec.Reader) (err error) {
+				count, err = r.ReadULEB128()
 				return err
 			}); err != nil {
 				return err
 			}
 			return r.ReadRequiredField(201, func(r *codec.Reader) error {
-				n, err := r.ReadULEB128()
+				n, err := r.ReadCount()
 				if err != nil {
 					return err
 				}
-				values := make([]string, int(n))
-				for i := range values {
+				if uint64(n) != count {
+					return fmt.Errorf("logicaltype: enum declares %d values but lists %d", count, n)
+				}
+				info.EnumValues = make([]string, 0, min(n, codec.MaxPrealloc))
+				for range n {
 					s, err := r.ReadString()
 					if err != nil {
 						return err
 					}
-					values[i] = s
+					info.EnumValues = append(info.EnumValues, s)
 				}
-				info.EnumValues = values
 				return nil
 			})
 		case ExtraAggregateState:
-			if err := r.ReadRequiredField(200, func(r *codec.Reader) error {
-				v, err := r.ReadString()
-				info.FunctionName = v
-				return err
-			}); err != nil {
+			// Deleted properties in 2.0; read them when an older writer sent them.
+			if err := r.ReadStringWithDefault(200, &info.FunctionName); err != nil {
 				return err
 			}
-			if err := r.ReadRequiredField(201, func(r *codec.Reader) error {
-				t, err := Decode(r)
+			if _, err := r.ReadOptionalField(201, typeField(&info.ReturnType)); err != nil {
+				return err
+			}
+			_, err := r.ReadOptionalField(202, func(r *codec.Reader) error {
+				n, err := r.ReadCount()
 				if err != nil {
 					return err
 				}
-				info.ReturnType = &t
-				return nil
-			}); err != nil {
-				return err
-			}
-			return r.ReadRequiredField(202, func(r *codec.Reader) error {
-				n, err := r.ReadULEB128()
-				if err != nil {
-					return err
-				}
-				args := make([]Type, int(n))
-				for i := range args {
-					t, err := Decode(r)
+				for range n {
+					t, err := decodeType(r, depth+1)
 					if err != nil {
 						return err
 					}
-					args[i] = t
+					info.BoundArgumentTypes = append(info.BoundArgumentTypes, t)
 				}
-				info.BoundArgumentTypes = args
 				return nil
 			})
+			return err
 		case ExtraArray:
-			if err := r.ReadRequiredField(200, func(r *codec.Reader) error {
-				t, err := Decode(r)
-				if err != nil {
-					return err
-				}
-				info.Child = &t
-				return nil
-			}); err != nil {
+			if err := r.ReadRequiredField(200, typeField(&info.Child)); err != nil {
 				return err
 			}
-			return r.ReadRequiredField(201, func(r *codec.Reader) error {
-				v, err := r.ReadULEB128()
-				info.ArraySize = uint32(v)
+			var size uint64
+			if err := r.ReadUintWithDefault(201, &size); err != nil {
 				return err
-			})
+			}
+			if size > math.MaxUint32 {
+				return fmt.Errorf("logicaltype: ARRAY size %d out of range", size)
+			}
+			info.ArraySize = uint32(size)
+			return nil
 		case ExtraAny:
-			if err := r.ReadRequiredField(200, func(r *codec.Reader) error {
-				t, err := Decode(r)
-				if err != nil {
-					return err
-				}
-				info.TargetType = &t
-				return nil
-			}); err != nil {
+			if err := r.ReadRequiredField(200, typeField(&info.TargetType)); err != nil {
 				return err
 			}
-			return r.ReadRequiredField(201, func(r *codec.Reader) error {
-				v, err := r.ReadULEB128()
-				info.CastScore = v
-				return err
-			})
+			return r.ReadUintWithDefault(201, &info.CastScore)
 		case ExtraIntegerLiteral:
-			peeked, err := r.PeekFieldID()
-			if err == nil && peeked == 200 {
+			if id, err := r.PeekFieldID(); err == nil && id == 200 {
 				return fmt.Errorf("logicaltype: INTEGER_LITERAL with bound value: %w", ErrUnsupported)
 			}
 			return nil
 		case ExtraTemplate:
-			if _, err := r.ReadOptionalField(200, func(r *codec.Reader) error {
-				v, err := r.ReadString()
-				info.TemplateName = v
-				return err
-			}); err != nil {
-				return err
-			}
-			return nil
+			return r.ReadStringWithDefault(200, &info.TemplateName)
 		case ExtraGeo:
-			if _, err := r.ReadOptionalField(200, func(r *codec.Reader) error {
+			return r.ReadRequiredField(200, func(r *codec.Reader) error {
 				return r.ReadObject(func(r *codec.Reader) error {
-					_, err := r.ReadOptionalField(100, func(r *codec.Reader) error {
-						v, err := r.ReadString()
-						info.CRSDefinition = v
-						return err
-					})
-					return err
+					return r.ReadStringWithDefault(100, &info.CRSDefinition)
 				})
-			}); err != nil {
-				return err
-			}
-			return nil
+			})
 		case ExtraUnbound:
-			peeked, err := r.PeekFieldID()
-			if err == nil && peeked == 204 {
+			if id, err := r.PeekFieldID(); err == nil && id == 204 {
 				return fmt.Errorf("logicaltype: UNBOUND with parsed expression: %w", ErrUnsupported)
 			}
-			if _, err := r.ReadOptionalField(200, func(r *codec.Reader) error {
-				v, err := r.ReadString()
-				info.UnboundName = v
-				return err
-			}); err != nil {
+			if err := r.ReadStringWithDefault(200, &info.UnboundName); err != nil {
 				return err
 			}
-			if _, err := r.ReadOptionalField(201, func(r *codec.Reader) error {
-				v, err := r.ReadString()
-				info.UnboundCatalog = v
-				return err
-			}); err != nil {
+			if err := r.ReadStringWithDefault(201, &info.UnboundCatalog); err != nil {
 				return err
 			}
-			if _, err := r.ReadOptionalField(202, func(r *codec.Reader) error {
-				v, err := r.ReadString()
-				info.UnboundSchema = v
-				return err
-			}); err != nil {
-				return err
-			}
-			return nil
+			return r.ReadStringWithDefault(202, &info.UnboundSchema)
 		}
 		return fmt.Errorf("logicaltype: unknown ExtraInfoType %d", info.Kind)
 	})
@@ -645,6 +668,8 @@ func decodeExtra(r *codec.Reader) (*ExtraInfo, error) {
 	return info, nil
 }
 
+// encodeChildren writes a child_list_t: a list of pair objects
+// {0: name, 1: LogicalType}. Both pair members are always written.
 func encodeChildren(w *codec.Writer, children []ChildType) {
 	w.WriteULEB128(uint64(len(children)))
 	for _, child := range children {
@@ -655,40 +680,36 @@ func encodeChildren(w *codec.Writer, children []ChildType) {
 	}
 }
 
-func decodeChildren(r *codec.Reader) ([]ChildType, error) {
-	n, err := r.ReadULEB128()
+func decodeChildren(r *codec.Reader, depth int) ([]ChildType, error) {
+	n, err := r.ReadCount()
 	if err != nil {
 		return nil, err
 	}
-	out := make([]ChildType, int(n))
-	for i := range out {
-		var pair ChildType
-		err := r.ReadObject(func(r *codec.Reader) error {
-			if err := r.ReadRequiredField(0, func(r *codec.Reader) error {
-				v, err := r.ReadString()
-				pair.Name = v
+	out := make([]ChildType, 0, min(n, codec.MaxPrealloc))
+	for range n {
+		var c ChildType
+		if err := r.ReadObject(func(r *codec.Reader) error {
+			if err := r.ReadRequiredField(0, func(r *codec.Reader) (err error) {
+				c.Name, err = r.ReadString()
 				return err
 			}); err != nil {
 				return err
 			}
-			return r.ReadRequiredField(1, func(r *codec.Reader) error {
-				t, err := Decode(r)
-				if err != nil {
-					return err
-				}
-				pair.Type = t
-				return nil
+			return r.ReadRequiredField(1, func(r *codec.Reader) (err error) {
+				c.Type, err = decodeType(r, depth+1)
+				return err
 			})
-		})
-		if err != nil {
+		}); err != nil {
 			return nil, err
 		}
-		out[i] = pair
+		out = append(out, c)
 	}
 	return out, nil
 }
 
-// Name returns a human-readable label for a logical type id.
+// Name returns DuckDB's display name for the type id (EnumUtil::ToString of
+// LogicalTypeId), e.g. "TIMESTAMP WITH TIME ZONE" or "TIMESTAMPTZ_NS".
+// Unknown ids render as "ID(n)".
 func (t Type) Name() string {
 	if name, ok := idNames[t.ID]; ok {
 		return name
@@ -696,16 +717,21 @@ func (t Type) Name() string {
 	return fmt.Sprintf("ID(%d)", t.ID)
 }
 
+// idNames mirrors GetLogicalTypeIdValues() in DuckDB v2.0.0 enum_util.cpp.
 var idNames = map[ID]string{
-	IDSQLNull: "NULL", IDBoolean: "BOOLEAN",
-	IDTinyint: "TINYINT", IDSmallint: "SMALLINT", IDInteger: "INTEGER", IDBigint: "BIGINT",
-	IDUTinyint: "UTINYINT", IDUSmallint: "USMALLINT", IDUInteger: "UINTEGER", IDUBigint: "UBIGINT",
-	IDHugeint: "HUGEINT", IDUHugeint: "UHUGEINT", IDFloat: "FLOAT", IDDouble: "DOUBLE",
-	IDDecimal: "DECIMAL", IDChar: "CHAR", IDVarchar: "VARCHAR", IDBlob: "BLOB", IDBit: "BIT",
-	IDDate: "DATE", IDTime: "TIME", IDTimeNs: "TIME_NS", IDTimeTz: "TIME WITH TIME ZONE",
-	IDTimestamp: "TIMESTAMP", IDTimestampSec: "TIMESTAMP_S", IDTimestampMs: "TIMESTAMP_MS",
-	IDTimestampNs: "TIMESTAMP_NS", IDTimestampTz: "TIMESTAMP WITH TIME ZONE",
-	IDInterval: "INTERVAL", IDUUID: "UUID", IDGeometry: "GEOMETRY",
-	IDStruct: "STRUCT", IDList: "LIST", IDMap: "MAP", IDArray: "ARRAY",
-	IDEnum: "ENUM", IDUnion: "UNION", IDVariant: "VARIANT",
+	IDInvalid: "INVALID", IDSQLNull: "NULL", IDUnknown: "UNKNOWN", IDAny: "ANY",
+	IDUnbound: "UNBOUND", IDTemplate: "TEMPLATE", IDType: "TYPE",
+	IDBoolean: "BOOLEAN", IDTinyint: "TINYINT", IDSmallint: "SMALLINT", IDInteger: "INTEGER", IDBigint: "BIGINT",
+	IDDate: "DATE", IDTime: "TIME", IDTimestampSec: "TIMESTAMP_S", IDTimestampMs: "TIMESTAMP_MS",
+	IDTimestamp: "TIMESTAMP", IDTimestampNs: "TIMESTAMP_NS", IDDecimal: "DECIMAL",
+	IDFloat: "FLOAT", IDDouble: "DOUBLE", IDChar: "CHAR", IDVarchar: "VARCHAR", IDBlob: "BLOB",
+	IDInterval: "INTERVAL", IDUTinyint: "UTINYINT", IDUSmallint: "USMALLINT", IDUInteger: "UINTEGER",
+	IDUBigint: "UBIGINT", IDTimestampTz: "TIMESTAMP WITH TIME ZONE", IDTimestampTzNs: "TIMESTAMPTZ_NS",
+	IDTimeTz: "TIME WITH TIME ZONE", IDTimeNs: "TIME_NS", IDBit: "BIT",
+	IDStringLiteral: "STRING_LITERAL", IDIntegerLiteral: "INTEGER_LITERAL", IDBignum: "BIGNUM",
+	IDUHugeint: "UHUGEINT", IDHugeint: "HUGEINT", IDPointer: "POINTER", IDValidity: "VALIDITY",
+	IDUUID: "UUID", IDGeometry: "GEOMETRY",
+	IDStruct: "STRUCT", IDList: "LIST", IDMap: "MAP", IDTable: "TABLE", IDEnum: "ENUM",
+	IDAggregateState: "LEGACY_AGGREGATE_STATE", IDLambda: "LAMBDA", IDUnion: "UNION",
+	IDArray: "ARRAY", IDVariant: "VARIANT", IDTuple: "TUPLE",
 }

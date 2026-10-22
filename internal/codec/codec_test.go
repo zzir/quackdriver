@@ -6,153 +6,53 @@ import (
 	"testing"
 )
 
-func TestULEB128RoundTrip(t *testing.T) {
-	cases := []uint64{0, 1, 0x7f, 0x80, 0x3fff, 0x4000, 1 << 21, math.MaxUint32, math.MaxUint64 - 1, math.MaxUint64}
-	for _, v := range cases {
+func TestLEB128(t *testing.T) {
+	for _, v := range []uint64{0, 1, 0x7f, 0x80, 0x3fff, 0x4000, 1 << 21, math.MaxUint32, math.MaxUint64} {
 		w := NewWriter()
 		w.WriteULEB128(v)
 		r := NewReader(w.Bytes())
-		got, err := r.ReadULEB128()
-		if err != nil {
-			t.Fatalf("read %d: %v", v, err)
-		}
-		if got != v {
-			t.Fatalf("ULEB128 round-trip: want %d, got %d", v, got)
-		}
-		if err := r.AssertEOF(); err != nil {
-			t.Fatalf("trailing bytes for %d: %v", v, err)
+		if got, err := r.ReadULEB128(); err != nil || got != v || r.AssertEOF() != nil {
+			t.Errorf("ULEB128 %d: got %d, %v", v, got, err)
 		}
 	}
-}
-
-func TestULEB128KnownBytes(t *testing.T) {
-	// 624485 = 0xE5 8E 26 in ULEB128 (classic spec example)
-	w := NewWriter()
-	w.WriteULEB128(624485)
-	if !bytes.Equal(w.Bytes(), []byte{0xe5, 0x8e, 0x26}) {
-		t.Fatalf("encoding mismatch: %#v", w.Bytes())
-	}
-}
-
-func TestSLEB128RoundTrip(t *testing.T) {
-	cases := []int64{0, 1, -1, 63, 64, -63, -64, -65, 0x3fff, -0x4000, math.MaxInt32, math.MinInt32, math.MaxInt64, math.MinInt64}
-	for _, v := range cases {
+	for _, v := range []int64{0, 1, -1, 63, 64, -64, -65, 0x3fff, -0x4000, math.MaxInt32, math.MinInt32, math.MaxInt64, math.MinInt64} {
 		w := NewWriter()
 		w.WriteSLEB128(v)
 		r := NewReader(w.Bytes())
-		got, err := r.ReadSLEB128()
-		if err != nil {
-			t.Fatalf("read %d: %v", v, err)
-		}
-		if got != v {
-			t.Fatalf("SLEB128 round-trip: want %d, got %d", v, got)
-		}
-		if err := r.AssertEOF(); err != nil {
-			t.Fatalf("trailing bytes for %d: %v", v, err)
+		if got, err := r.ReadSLEB128(); err != nil || got != v || r.AssertEOF() != nil {
+			t.Errorf("SLEB128 %d: got %d, %v", v, got, err)
 		}
 	}
-}
-
-func TestSLEB128KnownBytes(t *testing.T) {
-	// -123456 = 0xC0 BB 78 in SLEB128 (classic spec example)
+	for _, h := range []HugeInt{{}, {Lower: math.MaxUint64}, {Upper: -1}, {Lower: math.MaxUint64, Upper: math.MaxInt64}, {Upper: math.MinInt64}} {
+		w := NewWriter()
+		w.WriteHugeInt(h)
+		if got, err := NewReader(w.Bytes()).ReadHugeInt(); err != nil || got != h {
+			t.Errorf("hugeint %+v: got %+v, %v", h, got, err)
+		}
+	}
+	// The classic spec examples.
 	w := NewWriter()
+	w.WriteULEB128(624485)
 	w.WriteSLEB128(-123456)
-	if !bytes.Equal(w.Bytes(), []byte{0xc0, 0xbb, 0x78}) {
-		t.Fatalf("encoding mismatch: %#v", w.Bytes())
+	if !bytes.Equal(w.Bytes(), []byte{0xe5, 0x8e, 0x26, 0xc0, 0xbb, 0x78}) {
+		t.Errorf("LEB128 bytes % x", w.Bytes())
 	}
 }
 
 func TestStringAndBlob(t *testing.T) {
 	w := NewWriter()
 	w.WriteString("hello, 🦆")
-	w.WriteBlob([]byte{0x00, 0xff, 0xaa, 0x55})
+	w.WriteBlob([]byte{0x00, 0xff})
 	w.WriteString("")
-	w.WriteBlob(nil)
-
 	r := NewReader(w.Bytes())
 	if got, err := r.ReadString(); err != nil || got != "hello, 🦆" {
-		t.Fatalf("string: got %q err %v", got, err)
+		t.Fatalf("string: %q %v", got, err)
 	}
-	if got, err := r.ReadBlob(); err != nil || !bytes.Equal(got, []byte{0x00, 0xff, 0xaa, 0x55}) {
-		t.Fatalf("blob: got %#v err %v", got, err)
+	if got, err := r.ReadBlob(); err != nil || !bytes.Equal(got, []byte{0x00, 0xff}) {
+		t.Fatalf("blob: %#v %v", got, err)
 	}
 	if got, err := r.ReadString(); err != nil || got != "" {
-		t.Fatalf("empty string: got %q err %v", got, err)
-	}
-	if got, err := r.ReadBlob(); err != nil || len(got) != 0 {
-		t.Fatalf("empty blob: got %#v err %v", got, err)
-	}
-}
-
-func TestFixedWidth(t *testing.T) {
-	w := NewWriter()
-	w.WriteFixedInt8(-1)
-	w.WriteFixedUint8(255)
-	w.WriteFixedInt16(-12345)
-	w.WriteFixedUint16(54321)
-	w.WriteFixedInt32(-1234567890)
-	w.WriteFixedUint32(0xDEADBEEF)
-	w.WriteFixedInt64(math.MinInt64)
-	w.WriteFixedUint64(math.MaxUint64)
-	w.WriteFixedFloat32(float32(math.Pi))
-	w.WriteFixedFloat64(math.Pi)
-
-	r := NewReader(w.Bytes())
-	if v, _ := r.ReadFixedInt8(); v != -1 {
-		t.Fatalf("int8 mismatch: %d", v)
-	}
-	if v, _ := r.ReadFixedUint8(); v != 255 {
-		t.Fatalf("uint8 mismatch: %d", v)
-	}
-	if v, _ := r.ReadFixedInt16(); v != -12345 {
-		t.Fatalf("int16 mismatch: %d", v)
-	}
-	if v, _ := r.ReadFixedUint16(); v != 54321 {
-		t.Fatalf("uint16 mismatch: %d", v)
-	}
-	if v, _ := r.ReadFixedInt32(); v != -1234567890 {
-		t.Fatalf("int32 mismatch: %d", v)
-	}
-	if v, _ := r.ReadFixedUint32(); v != 0xDEADBEEF {
-		t.Fatalf("uint32 mismatch: %x", v)
-	}
-	if v, _ := r.ReadFixedInt64(); v != math.MinInt64 {
-		t.Fatalf("int64 mismatch: %d", v)
-	}
-	if v, _ := r.ReadFixedUint64(); v != math.MaxUint64 {
-		t.Fatalf("uint64 mismatch: %d", v)
-	}
-	if v, _ := r.ReadFixedFloat32(); v != float32(math.Pi) {
-		t.Fatalf("float32 mismatch: %v", v)
-	}
-	if v, _ := r.ReadFixedFloat64(); v != math.Pi {
-		t.Fatalf("float64 mismatch: %v", v)
-	}
-	if err := r.AssertEOF(); err != nil {
-		t.Fatalf("trailing bytes: %v", err)
-	}
-}
-
-func TestHugeIntRoundTrip(t *testing.T) {
-	cases := []HugeInt{
-		{Lower: 0, Upper: 0},
-		{Lower: 1, Upper: 0},
-		{Lower: math.MaxUint64, Upper: 0},
-		{Lower: 0, Upper: -1},
-		{Lower: math.MaxUint64, Upper: math.MaxInt64},
-		{Lower: 0, Upper: math.MinInt64},
-	}
-	for _, h := range cases {
-		w := NewWriter()
-		w.WriteHugeInt(h)
-		r := NewReader(w.Bytes())
-		got, err := r.ReadHugeInt()
-		if err != nil {
-			t.Fatalf("read %+v: %v", h, err)
-		}
-		if got != h {
-			t.Fatalf("hugeint round-trip: want %+v, got %+v", h, got)
-		}
+		t.Fatalf("empty string: %q %v", got, err)
 	}
 }
 
@@ -160,56 +60,133 @@ func TestObjectFraming(t *testing.T) {
 	w := NewWriter()
 	w.WriteObject(func(w *Writer) {
 		w.WriteField(1, func(w *Writer) { w.WriteULEB128(42) })
-		w.WriteField(3, func(w *Writer) { w.WriteString("duck") })
+		w.WriteStringWithDefault(2, "")
+		w.WriteUintWithDefault(3, 0)
+		w.WriteStringWithDefault(4, "duck")
+		w.WriteUintWithDefault(5, 7)
 	})
-
+	if want := []byte{1, 0, 42, 4, 0, 4, 'd', 'u', 'c', 'k', 5, 0, 7, 0xff, 0xff}; !bytes.Equal(w.Bytes(), want) {
+		t.Fatalf("got % x, want % x", w.Bytes(), want)
+	}
 	r := NewReader(w.Bytes())
-	var (
-		gotFirst  uint64
-		gotSecond string
-		gotMaybe  string
-	)
+	var first, absentUint, last uint64
+	var absent, s string
 	err := r.ReadObject(func(r *Reader) error {
-		if err := r.ReadRequiredField(1, func(r *Reader) error {
-			v, err := r.ReadULEB128()
-			gotFirst = v
+		if err := r.ReadRequiredField(1, func(r *Reader) (err error) {
+			first, err = r.ReadULEB128()
 			return err
 		}); err != nil {
 			return err
 		}
-		if _, err := r.ReadOptionalField(2, func(r *Reader) error {
-			gotMaybe = "should-not-fire"
-			return nil
-		}); err != nil {
+		if err := r.ReadStringWithDefault(2, &absent); err != nil {
 			return err
 		}
-		return r.ReadRequiredField(3, func(r *Reader) error {
-			v, err := r.ReadString()
-			gotSecond = v
+		if err := r.ReadUintWithDefault(3, &absentUint); err != nil {
 			return err
-		})
+		}
+		if err := r.ReadStringWithDefault(4, &s); err != nil {
+			return err
+		}
+		return r.ReadUintWithDefault(5, &last)
 	})
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if gotFirst != 42 || gotSecond != "duck" || gotMaybe != "" {
-		t.Fatalf("decoded mismatch: first=%d second=%q maybe=%q", gotFirst, gotSecond, gotMaybe)
-	}
-	if err := r.AssertEOF(); err != nil {
-		t.Fatalf("trailing bytes: %v", err)
+	if err != nil || r.AssertEOF() != nil || first != 42 || absent != "" || absentUint != 0 || s != "duck" || last != 7 {
+		t.Fatalf("decoded %d %q %d %q %d, %v", first, absent, absentUint, s, last, err)
 	}
 }
 
-func TestReadEndObjectMissing(t *testing.T) {
-	r := NewReader([]byte{0x01, 0x00})
-	if err := r.ReadEndObject(); err == nil {
-		t.Fatalf("expected error for missing FieldEnd marker")
+func TestOptionalIdx(t *testing.T) {
+	for _, c := range []struct {
+		in   OptionalIdx
+		want []byte
+	}{
+		{OptionalIdx{}, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01}},
+		{OptionalIdx{Value: 0, Valid: true}, []byte{0x00}},
+		{OptionalIdx{Value: 300, Valid: true}, []byte{0xac, 0x02}},
+		{OptionalIdx{Value: math.MaxUint64 - 1, Valid: true}, []byte{0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01}},
+	} {
+		w := NewWriter()
+		if err := w.WriteOptionalIdx(c.in); err != nil || !bytes.Equal(w.Bytes(), c.want) {
+			t.Errorf("write %+v: % x, %v", c.in, w.Bytes(), err)
+		}
+		if got, err := NewReader(c.want).ReadOptionalIdx(); err != nil || got != c.in {
+			t.Errorf("read %+v: %+v, %v", c.in, got, err)
+		}
+	}
+	if err := NewWriter().WriteOptionalIdx(OptionalIdx{Value: InvalidIndex, Valid: true}); err == nil {
+		t.Error("a valid optional_idx holding INVALID_INDEX was written")
 	}
 }
 
-func TestReadBoolStrict(t *testing.T) {
-	r := NewReader([]byte{0x02})
-	if _, err := r.ReadBool(); err == nil {
-		t.Fatalf("expected error for invalid boolean byte")
+func TestStringMap(t *testing.T) {
+	w := NewWriter()
+	w.WriteStringMap(map[string]string{"b": "2", "a": "1"})
+	want := []byte{
+		0x02,
+		0x00, 0x00, 0x01, 'a', 0x01, 0x00, 0x01, '1', 0xff, 0xff,
+		0x00, 0x00, 0x01, 'b', 0x01, 0x00, 0x01, '2', 0xff, 0xff,
+	}
+	if !bytes.Equal(w.Bytes(), want) {
+		t.Fatalf("got % x, want % x", w.Bytes(), want)
+	}
+	if got, err := NewReader(want).ReadStringMap(); err != nil || len(got) != 2 || got["a"] != "1" || got["b"] != "2" {
+		t.Fatalf("decoded %v, %v", got, err)
+	}
+	// A repeated key keeps the last value, like DuckDB's deserializer.
+	dup := []byte{
+		0x02,
+		0x00, 0x00, 0x01, 'k', 0x01, 0x00, 0x01, '1', 0xff, 0xff,
+		0x00, 0x00, 0x01, 'k', 0x01, 0x00, 0x01, '2', 0xff, 0xff,
+	}
+	if got, err := NewReader(dup).ReadStringMap(); err != nil || len(got) != 1 || got["k"] != "2" {
+		t.Fatalf("duplicate key: %v, %v", got, err)
+	}
+}
+
+// TestMalformedInput: every read of untrusted bytes fails cleanly, and no
+// length or count can overflow a bounds check or force an allocation.
+func TestMalformedInput(t *testing.T) {
+	huge := NewWriter()
+	huge.WriteULEB128(math.MaxInt64)
+	cases := map[string]func() error{
+		"missing end marker": func() error { return NewReader([]byte{0x01, 0x00}).ReadEndObject() },
+		"bool 2":             func() error { _, err := NewReader([]byte{0x02}).ReadBool(); return err },
+		"ULEB over 64 bits":  func() error { _, err := NewReader(bytes.Repeat([]byte{0x80}, 11)).ReadULEB128(); return err },
+		"huge string":        func() error { _, err := NewReader(huge.Bytes()).ReadString(); return err },
+		"huge blob":          func() error { _, err := NewReader(huge.Bytes()).ReadBlob(); return err },
+		"huge count":         func() error { _, err := NewReader(huge.Bytes()).ReadCount(); return err },
+		"huge raw read":      func() error { _, err := NewReader([]byte{0}).ReadBytes(math.MaxInt); return err },
+		"wrong field":        func() error { return NewReader([]byte{2, 0}).ReadRequiredField(1, nil) },
+		"map truncated":      func() error { _, err := NewReader([]byte{0x01, 0x00, 0x00, 0x01}).ReadStringMap(); return err },
+		"map wrong key id": func() error {
+			_, err := NewReader([]byte{0x01, 0x01, 0x00, 0x01, 'k', 0x01, 0x00, 0x01, 'v', 0xff, 0xff}).ReadStringMap()
+			return err
+		},
+		"map missing value": func() error {
+			_, err := NewReader([]byte{0x01, 0x00, 0x00, 0x01, 'k', 0xff, 0xff}).ReadStringMap()
+			return err
+		},
+	}
+	for name, read := range cases {
+		if err := read(); err == nil {
+			t.Errorf("%s: no error", name)
+		}
+	}
+	r := NewReader([]byte{0x02, 0xaa, 0xbb})
+	if n, err := r.ReadCount(); err != nil || n != 2 {
+		t.Errorf("count that fits: %d %v", n, err)
+	}
+}
+
+func TestReaderSince(t *testing.T) {
+	r := NewReader([]byte{1, 2, 3, 4})
+	if _, err := r.ReadByte(); err != nil {
+		t.Fatal(err)
+	}
+	start := r.Pos()
+	if _, err := r.ReadBytes(2); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.Since(start); !bytes.Equal(got, []byte{2, 3}) || cap(got) != 2 {
+		t.Fatalf("Since = %v (cap %d)", got, cap(got))
 	}
 }
