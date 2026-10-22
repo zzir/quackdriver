@@ -1,5 +1,9 @@
 version: "2"
 
+run:
+  # Lint the integration tests too (they are excluded from plain builds).
+  build-tags: [integration]
+
 linters:
   # On top of the defaults (errcheck, govet, ineffassign, staticcheck, unused).
   enable:
@@ -29,13 +33,10 @@ linters:
       # matter are checked explicitly on the non-deferred paths.
       - linters: [errcheck]
         source: 'defer .*\.Close\(\)$'
-      # "handoff_occured" (sic) deliberately matches the Python SDK's spelling.
-      - linters: [misspell]
-        source: occured
-      # Tests and examples implement fixed callback signatures (tools,
-      # guardrails, models) where parameters often go unused; examples in
-      # particular should show the real signature, not a row of underscores.
-      # Production code keeps the rule.
+      # Tests and examples implement fixed callback signatures (database/sql
+      # driver interfaces, HTTP handlers) where parameters often go unused;
+      # examples in particular should show the real signature, not a row of
+      # underscores. Production code keeps the rule.
       - linters: [revive]
         path: (_test\.go$|^examples/|/example/)
         text: unused-parameter
@@ -44,3 +45,7 @@ linters:
       - linters: [gocritic]
         path: (^examples/|^cmd/)
         text: exitAfterDefer
+
+formatters:
+  enable:
+    - gofmt
