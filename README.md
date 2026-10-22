@@ -2,30 +2,17 @@
 
 Pure-Go [`database/sql`](https://pkg.go.dev/database/sql) driver for [DuckDB](https://duckdb.org/)'s **Quack** remote protocol.
 
-> **Status: alpha (v0.1.x).** The Quack protocol itself is pre-1.0 (target DuckDB v2.0, 2026-09). This driver is pinned to DuckDB v1.5.3 servers and breaking wire-format changes are expected through v2.0. Production users should treat the wire layer as load-bearing and lock to specific DuckDB releases.
-
-## Contents
-
-- [Highlights](#highlights)
-- [Install](#install)
-- [Quick start](#quick-start)
-- [Bulk insert with `Conn.Append`](#bulk-insert-with-connappend)
-- [bun ORM](#bun-orm)
-- [DSN](#dsn)
-- [Type mapping](#type-mapping)
-- [Limitations & gotchas](#limitations--gotchas)
-- [Development](#development)
-- [References](#references)
-- [License](#license)
+> **Status: alpha (v0.2.0-dev).** The driver speaks Quack protocol **v3**, the protocol of **DuckDB 2.0**. It does not talk to DuckDB 1.x servers (Quack v1): the handshake fails with a message saying that DuckDB 2.0 or newer is required. DuckDB does not consider the Quack protocol stable yet, so pin DuckDB releases in production.
 
 ## Highlights
 
-- **No CGO.** No `libduckdb` embedded. The driver speaks HTTP/2 to a remote DuckDB server, so it cross-compiles like any other pure-Go binary.
-- **Zero third-party dependencies** in the core driver. Only the Go standard library — `net/http`, `encoding/binary`, `database/sql/driver`.
-- **`database/sql/driver` compatible.** Works with `sql.Open("quack", dsn)`, `*sql.DB` connection pooling, prepared statements (client-side), and transactions.
-- **Bulk-insert path** — `Conn.Append` ships rows as a single column-major DataChunk in one round-trip. Measured **~1000× faster** than parameterized INSERT for batches.
-- **bun ORM** support via `sqlitedialect`.
-- **Golden-fixture-locked wire format.** 38 captured request/response pairs in `testdata/golden/` guard against silent protocol drift. Unit tests run without a server.
+- **No CGO.** No `libduckdb` embedded. The driver speaks HTTP/1.1 (`POST /quack`) to a remote DuckDB server, so it cross-compiles like any other pure-Go binary.
+- **Zero third-party dependencies** in the core driver: only the Go standard library.
+- **`database/sql` compatible.** `sql.Open("quack", dsn)`, connection pooling, client-side prepared statements, transactions, `context` cancellation (sent to the server as `CANCEL`), typed column metadata.
+- **Streaming results.** Large results arrive in FETCH batches that the driver reads ahead in the background (`fetch_ahead`), with heartbeats keeping the session alive between batches.
+- **Bulk insert.** `Conn.Append` and the streaming `Appender` stream rows (`SEND_DATA`) into one atomic `INSERT` that casts them with DuckDB's own rules: millions of rows per second against a local server, versus thousands for single-row `INSERT` statements.
+- **TLS with certificate pinning** (`ssl_fingerprint`), custom TLS configuration and extra HTTP headers for reverse proxies.
+- **Golden-fixture-locked wire format.** 79 request/response exchanges captured from the official DuckDB v2.0.0 release CLI (quack extension `f96420e`; see [`testdata/golden/README.md`](./testdata/golden/README.md)) guard against protocol drift; unit tests run without a server.
 
 ## Install
 
@@ -36,7 +23,7 @@ go get github.com/zzir/quackdriver
 Requirements:
 
 - Go 1.22+
-- DuckDB CLI v1.5.3+ with the Quack extension (`INSTALL quack; LOAD quack;`) for the server side
+- For the server side: the DuckDB CLI **v2.0.0 or newer** with the Quack extension (`INSTALL quack; LOAD quack;`)
 
 ## Quick start
 
@@ -45,7 +32,7 @@ Start a server (in one terminal):
 ```bash
 bash scripts/start-quack-server.sh
 # or:
-duckdb -cmd "INSTALL quack; LOAD quack; CALL quack_serve('quack:127.0.0.1:9494', token=>'super_secret');"
+duckdb -cmd "INSTALL quack; LOAD quack; CALL quack_serve('quack:127.0.0.1:9494', token => 'super_secret');"
 ```
 
 Use it from Go:
@@ -82,36 +69,47 @@ func main() {
         }
         fmt.Println(i, s)
     }
+    if err := rows.Err(); err != nil {
+        log.Fatal(err)
+    }
 }
 ```
 
-> **Use `127.0.0.1`, not `localhost`.** Go's resolver prefers IPv6 (`::1`), but `quack_serve` binds IPv4 only — you will get `connection refused` if you write `quack://localhost:9494` in the DSN.
+A server bound to `127.0.0.1` or `localhost` speaks plain HTTP by default; one bound to any other address speaks HTTPS with a self-signed certificate (see [`ssl_fingerprint`](#dsn-and-connector-options)).
 
-More example programs in [`examples/`](./examples) (each is `go run ./examples/<name>`):
+## Examples
+
+Each example is `go run ./examples/<name>`. They connect to `QUACK_HOST:QUACK_PORT` (default `127.0.0.1:9494`) with `QUACK_TOKEN` (default `super_secret`), or to a full `QUACK_DSN`. The integration suite (`make test-integration`) builds and runs them all against its own server.
 
 | Example | What it shows |
 |---|---|
-| `basic` | Connection, DDL/DML, Tx, multi-chunk fetch |
-| `types` | All 13 primitive types round-tripped |
-| `nested` | LIST / STRUCT / ARRAY / MAP / DECIMAL / INTERVAL decoding |
-| `timeutc` | TIME → `time.Duration`, INTERVAL helpers |
-| `append` | High-level `Conn.Append` API |
-| `append-rich` | APPEND with DECIMAL / HUGEINT / UUID / INTERVAL / LIST / ARRAY |
-| `append-struct` | APPEND with STRUCT / MAP / 2D ARRAY |
-| `bench-append` | INSERT vs APPEND throughput benchmark |
+| `basic` | Connection, DDL/DML in a transaction, `RowsAffected`, `$N` and `$name` placeholders, a typed `*quackdriver.Error`; a result spanning many FETCH batches, early `Close`, updates while iterating inside a transaction |
+| `types` | Every scalar type, each Go value checked against the server's own `VARCHAR` rendering; LIST / ARRAY / STRUCT / TUPLE / MAP / UNION values; TIME, TIMETZ (`TimeTzValue`), INTERVAL (`IntervalValue`), TIMESTAMPTZ and BC timestamps; time values as query arguments |
+| `append` | `Conn.Append` with rich and nested types and a user-defined ENUM, a rejected Go value and a value the server cannot cast; the streaming `Appender` with a skipped row, `Close` returning the inserted count, `ErrConnBusy`, `Abort` and a constraint violation |
+| `tls-pin` | HTTPS with `ssl_fingerprint` pinning; wrong pins and unpinned HTTPS are refused (prints setup instructions when no certificate is given) |
+| `bench-append` | Per-row INSERT vs 1000-row INSERT vs `Conn.Append` vs `Appender` (`make bench`) |
 | `bun` | bun ORM integration (separate `go.mod`) |
 
-## Bulk insert with `Conn.Append`
+## Bulk insert: `Conn.Append` and `Appender`
 
-Quack supports a wire-level `APPEND_REQUEST` path that bypasses SQL parsing and binding entirely — rows go straight from the client into the server's table buffer as a column-major DataChunk. For batches this is **vastly** faster than `INSERT VALUES`:
+Quack v3 has a client data stream: the server runs
 
-```
-INSERT 10000 rows: 1.86s   (5,384 rows/sec)
-APPEND 10000 rows: 1.78ms  (5,612,198 rows/sec)
-speedup:           1042×
+```sql
+INSERT INTO t (cols) SELECT c0::T0, c1::T1, ... FROM scan_data_from_quack_client(...)
 ```
 
-The high-level API:
+and the client sends each value as text in DataChunks of VARCHAR columns (`SEND_DATA`), so values are never rendered as SQL. The server casts them, so DuckDB's own rules decide what a value means and whether it fits. The whole load is one statement: if it fails or is aborted, no row is inserted.
+
+Measured against a local DuckDB 2.0 server (200,000 rows of `(BIGINT, VARCHAR, DOUBLE)`, `make bench`):
+
+```
+INSERT per row               1000 rows    312ms         3204 rows/s
+INSERT 1000 rows/stmt      200000 rows    2.35s        85186 rows/s
+Conn.Append                200000 rows     46ms      4310159 rows/s
+Appender                   200000 rows     62ms      3243454 rows/s
+```
+
+`Conn.Append` streams rows already in memory:
 
 ```go
 import "github.com/zzir/quackdriver"
@@ -125,31 +123,45 @@ err := conn.Raw(func(d any) error {
             {Name: "id",      Type: "BIGINT"},
             {Name: "profile", Type: "STRUCT(name VARCHAR, score DECIMAL(9,2))"},
             {Name: "tags",    Type: "VARCHAR[]"},
-            {Name: "result",  Type: "UNION(num INTEGER, err VARCHAR)"},
+            {Name: "mood",    Type: "mood"}, // a user-defined ENUM
         },
         [][]any{
-            {int64(1), map[string]any{"name": "alice", "score": "98.5"}, []any{"go", "duckdb"}, map[string]any{"num": 42}},
-            {int64(2), map[string]any{"name": "bob",   "score": "73.2"}, []any{"sql"},          map[string]any{"err": "timeout"}},
+            {int64(1), map[string]any{"name": "alice", "score": "98.5"}, []any{"go", "duckdb"}, "happy"},
+            {int64(2), map[string]any{"name": "bob",   "score": 73.2},   []any{"sql"},          nil},
         },
     )
 })
 ```
 
-The `Type` field accepts the full DuckDB type grammar:
+The `Appender` streams rows as they are produced, buffering about `WithBatchBytes` (default 32 MiB) per request, and `Close` returns the number of rows the server inserted:
 
-| Form | Notes |
-|---|---|
-| `BOOLEAN`, `INTEGER`, `BIGINT`, `VARCHAR`, ... | Simple names (case-insensitive). |
-| `DECIMAL(18, 4)` | Width 1–38, scale 0..width. |
-| `HUGEINT`, `UHUGEINT`, `UUID`, `INTERVAL` | 128-bit / UUID / temporal interval. |
-| `DATE`, `TIMESTAMP`, `TIMESTAMP_MS`, `TIMESTAMP_NS` | Accept `time.Time`. |
-| `INTEGER[]`, `LIST(INTEGER)` | LIST; accepts `[]any`. |
-| `INTEGER[3]` | Fixed-size ARRAY; accepts `[]any` of exact length. |
-| `STRUCT(a INTEGER, b VARCHAR)` | Accepts `map[string]any`. |
-| `MAP(VARCHAR, INTEGER)` | Accepts `map[string]any` or `[]any` of `{key, value}` entries. |
-| `UNION(num INTEGER, str VARCHAR)` | Accepts `map[string]any` with **exactly one** non-nil variant key. |
+```go
+err := conn.Raw(func(d any) error {
+    a, err := d.(*quackdriver.Conn).NewAppender(ctx, "", "events", cols)
+    if err != nil {
+        return err
+    }
+    defer a.Abort() // no-op after a successful Close
+    for e := range events {
+        if err := a.AppendRow(e.ID, e.Name, e.At); err != nil {
+            var ve *quackdriver.ValueError
+            if errors.As(err, &ve) {
+                continue // the row was skipped; the Appender is still usable
+            }
+            return err // the stream has ended
+        }
+    }
+    n, err := a.Close()
+    log.Printf("inserted %d rows", n)
+    return err
+})
+```
 
-Pass `nil` for SQL NULL anywhere.
+While an `Appender` is open it holds its connection: other statements on it fail with `ErrConnBusy`. A connection returned to the pool with an `Appender` still open (neither `Close` nor `Abort` was called) is discarded, which aborts its `INSERT`. `WithUnordered()` lets the server insert in parallel without keeping the row order. Cancel the context given to `NewAppender` to abort a blocked call.
+
+`AppendColumn.Type` is any DuckDB type expression (`INTEGER`, `DECIMAL(18, 4)`, `INTEGER[3]`, `STRUCT(a INTEGER, "b c" VARCHAR)`, `MAP(VARCHAR, INTEGER)`, an alias such as `TEXT`, or a user-defined type). The server resolves the types in a statement of its own when the `Appender` starts; the values each type accepts are in the [write table](#write-direction-go--duckdb-via-connappend-and-appender) below.
+
+A Go value a column does not accept (a `bool` for a VARCHAR column, say) is a `*quackdriver.ValueError` naming the row and column: the `Appender` skips the row, `Conn.Append` aborts the statement. A value DuckDB cannot cast (an out-of-range integer, a malformed UUID, an unknown ENUM label, a duplicate MAP key) fails the statement on the server with a `*quackdriver.Error`; nothing is inserted.
 
 ## bun ORM
 
@@ -176,125 +188,217 @@ sqldb, _ := sql.Open("quack", "quack://127.0.0.1:9494?token=super_secret")
 db := bun.NewDB(sqldb, sqlitedialect.New())
 ```
 
-> **bun gotcha — `INTEGER` vs `BIGINT`.** bun's sqlitedialect maps `int64` Go fields to SQL `INTEGER`, which is 64-bit in SQLite but **32-bit in DuckDB**. Scans of `int32` values back into `int64` then fail. Annotate `int64` columns explicitly with `type:BIGINT`.
+> **bun gotcha — `INTEGER` vs `BIGINT`.** bun's sqlitedialect maps `int64` Go fields to SQL `INTEGER`, which is 64-bit in SQLite but **32-bit in DuckDB**. Annotate `int64` columns explicitly with `type:BIGINT`.
 
 Full working example in [`examples/bun/`](./examples/bun).
 
-## DSN
+## DSN and connector options
 
 ```
-quack://host:port?token=<token>&tls=<bool>&timeout=<duration>
+quack://host:port?token=<token>&...
 quack:host:port?token=<token>
-quack:[::1]:9494?token=<token>     # IPv6
+quack:host                          # port 9494
+quack:[::1]:9494?token=<token>      # IPv6
 ```
 
-| Param      | Default | Notes                                                |
-|------------|---------|------------------------------------------------------|
-| `token`    | (none)  | Auth token, must be at least 4 characters.           |
-| `tls`      | `false` | If `true`, the driver uses `https://`.               |
-| `timeout`  | `30s`   | Per-request HTTP timeout. Accepts any `time.Duration` string. |
+Parameter names are case-insensitive, each may appear once, and unknown names are rejected. Values are URL-decoded, so a literal `+`, `&` or `%` must be percent-encoded.
+
+| Param | Default | Notes |
+|---|---|---|
+| `token` | (none) | Authentication token. The server's authentication function decides whether it is accepted (by default it must equal the server's token, which is at least 4 characters). |
+| `tls` | local host: `false`, else `true` | HTTPS on/off. Local hosts are `localhost`, `127.0.0.1` and `::1`. |
+| `disable_ssl` | | The official client's inverse of `tls`. |
+| `ssl_fingerprint` | (none) | SHA-256 of the server certificate (as `quack_generate_keys()` reports it; colons, case and a `sha256:` prefix are ignored). Implies HTTPS; the pin replaces CA and hostname verification. |
+| `timeout` | none | Upper bound for each HTTP request. Without it, statements run as long as they need and the `context` decides. |
+| `connect_timeout` | `10s` | TCP connect and TLS handshake. |
+| `heartbeat_timeout` | `60s` | Session lease requested from the server (whole seconds, at least 1s). The driver sends heartbeats well within it. |
+| `client_id` | `$QUACK_CLIENT_ID`, else a random per-process id | Sent in the handshake; empty or at least 4 characters. |
+| `inline_rows` | server setting | Rows the server may return inline in the PREPARE response. |
+| `fetch_ahead` | `1` | FETCH requests kept in flight while a result is read (read-ahead); `0` disables it. |
+| `max_buffered_rows` | `1000000` | The most rows of an open `Rows` the driver buffers in memory when another statement starts on the same connection (see [Limitations](#limitations--gotchas)); a statement that would need more fails with an error naming this parameter, and the `Rows` stays readable. `0` removes the bound. |
+| `timezone` | server setting | The session's `TimeZone`, set (`SET SESSION TimeZone = ...`) right after each connection's handshake. Use `timezone=UTC` when `time.Time` arguments meet `TIMESTAMPTZ` values (see [Query parameters](#query-parameters)). |
+
+Durations use Go syntax (`30s`, `1m`); a bare integer means seconds.
+
+`NewConnector(dsn, opts...)` with `sql.OpenDB` takes options: `WithTLSConfig` (custom root CAs, client certificates), `WithHeader` (for example authentication for a reverse proxy), `WithMaxIdleConnsPerHost` (the idle HTTP connection pool, default 32; size it at about (2 + `fetch_ahead`) × the `database/sql` pool size for many busy connections) and `WithHTTPClient` (a caller-owned `*http.Client`; it should not follow redirects). Like any Go HTTP client, the driver honours `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY`. The driver never follows HTTP redirects (a Quack server does not send them).
+
+Through `sql.Conn.Raw`, `(*quackdriver.Conn).ServerInfo()` reports what the server said in the handshake: its DuckDB version and platform, the Quack protocol version and the heartbeat lease it granted.
+
+## Query parameters
+
+Quack carries only SQL text, so the driver substitutes arguments as SQL literals before sending (`internal/sqlfmt`, the driver's injection-defense surface; it is covered by property tests against a real server). Placeholders:
+
+| Form | Meaning |
+|---|---|
+| `?` | The next positional argument. |
+| `?N`, `$N` | Positional argument N (1-based); may repeat. Cannot be mixed with `?`. |
+| `$name` | The argument passed as `sql.Named("name", v)`. Without such an argument, `$name` is left for DuckDB (session variables). |
+
+Placeholders inside strings (`'...'`, `E'...'`, `$tag$...$tag$`), quoted identifiers and comments are ignored. Every placeholder needs an argument and every argument must be used.
+
+| Go value | SQL literal |
+|---|---|
+| `nil` | `NULL` |
+| `bool` | `TRUE` / `FALSE` |
+| integers, `*big.Int`, `big.Int` | integer literal (DuckDB picks INTEGER, BIGINT, HUGEINT, ...) |
+| `float32`, `float64` | DOUBLE literal in exponent form (`1.5e+00`); NaN, ±Inf and -0 as `'nan'::DOUBLE` etc. |
+| `*big.Rat` | DECIMAL literal of at most 38 digits (rounded half away from zero if needed); integral values as integer literals. A non-integer with 38 or more integer digits is an error. |
+| `string` | `'...'` with single quotes doubled (backslashes have no special meaning in DuckDB's standard strings) |
+| `[]byte` | BLOB literal; a nil `[]byte` (what a NULL scans into) is `NULL` |
+| `time.Time` | `TIMESTAMP '...'` of its UTC wall clock, `TIMESTAMP_NS '...'` with sub-microsecond digits; `InfinityTime` / `NegInfinityTime` as `TIMESTAMP 'infinity'` / `'-infinity'`. See the `TIMESTAMPTZ` note below. |
+| `time.Duration` | `INTERVAL` (microsecond precision) |
+| `IntervalValue`, `TimeTzValue` | `INTERVAL '...'`, `TIMETZ '...'` |
+| `driver.Valuer` | its value |
+
+**`time.Time` and `TIMESTAMPTZ`.** A `time.Time` argument is a zone-less `TIMESTAMP` literal of its UTC wall clock. Where it meets a `TIMESTAMPTZ` (a column, a comparison, a cast), DuckDB converts it in the session's `TimeZone`, which defaults to the server host's zone: on a server outside UTC the stored or compared instant is off by the zone offset, while `TIMESTAMPTZ` values always scan into the correct UTC instant. Add `timezone=UTC` to the DSN (or run `SET TimeZone = 'UTC'` on the session) whenever `time.Time` arguments meet `TIMESTAMPTZ` values. `Conn.Append` and the `Appender` write `TIMESTAMPTZ` columns from the instant and are not affected.
+
+A query string with several statements runs them all, but returns only one result: the first statement's that returns rows, otherwise the last statement's. Its `RowsAffected` describes that one result.
+
+DuckDB replaces Unicode space characters in the query text with `' '` before parsing, using a simpler quoting model than its tokenizer. If that would change a substituted string (for example when a comment or an `E''` string before the placeholder contains a quote), or change where a string literal, comment or placeholder of the query begins or ends (a Unicode space in the query text, for example copied from a web page, can split a word into an `E'...'` or `$tag$` opener), the query is rejected instead of being silently altered. A substituted string that DuckDB would join onto a string literal on the previous line (DuckDB concatenates `'a'` + newline + `'b'`, keeping the first literal's `E`/`X` kind) is parenthesized, so it stays a separate value.
 
 ## Type mapping
 
 ### Read direction (DuckDB → Go)
 
-| DuckDB type | Go type returned to `Rows.Scan` |
+| DuckDB type | Go type returned to `Rows.Scan` (`any`) |
 |---|---|
 | `BOOLEAN` | `bool` |
 | `TINYINT` / `SMALLINT` / `INTEGER` / `BIGINT` | `int8` / `int16` / `int32` / `int64` |
 | `UTINYINT` / `USMALLINT` / `UINTEGER` / `UBIGINT` | `uint8` / `uint16` / `uint32` / `uint64` |
-| `HUGEINT`, `UHUGEINT` | `*big.Int` |
+| `HUGEINT`, `UHUGEINT`, `BIGNUM` | `*big.Int` |
 | `FLOAT`, `DOUBLE` | `float32`, `float64` |
-| `VARCHAR`, `CHAR`, `UUID` | `string` |
-| `BLOB`, `BIT`, `GEOMETRY` | `[]byte` |
+| `DECIMAL(w, s)` | `string`, exact (e.g. `"12345.67"`) |
+| `VARCHAR`, `CHAR`, `JSON` | `string` |
+| `UUID` | `string` (lowercase 8-4-4-4-12) |
+| `BIT` | `string` of `0`/`1` |
+| `ENUM` | `string` label |
+| `BLOB` | `[]byte` |
+| `GEOMETRY` | `[]byte` (WKB) |
 | `DATE` | `time.Time` (UTC midnight) |
-| `TIMESTAMP`, `TIMESTAMP_S/MS/NS`, `TIMESTAMP WITH TIME ZONE` | `time.Time` (UTC) |
-| `TIME`, `TIME_NS` | `time.Duration` (since midnight) |
-| `TIME WITH TIME ZONE` | `message.TimeTzValue` (raw 64-bit packed bits) |
-| `INTERVAL` | `message.IntervalValue` (months / days / micros) |
-| `DECIMAL(w, s)` | `string` (e.g. `"12345.67"`) |
-| `LIST<T>`, `ARRAY<T, N>` | `[]any` |
-| `STRUCT<...>` | `map[string]any` |
-| `MAP<K, V>` | `[]any` of `map[string]any{"key": ..., "value": ...}` |
-| `UNION<...>` | `map[string]any` including a `""` tag field (uint8) |
+| `TIMESTAMP`, `TIMESTAMP_S/_MS/_NS`, `TIMESTAMPTZ`, `TIMESTAMPTZ_NS` | `time.Time` (UTC) |
+| `TIME`, `TIME_NS` | `time.Duration` since midnight |
+| `TIME WITH TIME ZONE` | `quackdriver.TimeTzValue` (`TimeOfDay`, `OffsetSeconds`, `Location`, ...; build one with `NewTimeTz`, the zero value is `00:00:00+00`) |
+| `INTERVAL` | `quackdriver.IntervalValue` (months / days / micros) |
+| `LIST`, `ARRAY` | `[]any` |
+| `STRUCT` | `map[string]any` |
+| `TUPLE` (unnamed STRUCT) | `[]any`, positional |
+| `MAP` | `[]any` of `map[string]any{"key": k, "value": v}` (keeps the order) |
+| `UNION` | `map[string]any` with the members (the inactive ones `nil`) and the tag under `""` (`uint8`) |
 | `NULL` (any column) | `nil` |
 
-### Write direction (Go → DuckDB via `Conn.Append`)
+`VARIANT` values are not decoded: a query whose result has a VARIANT column, also nested in another type, fails with an error suggesting a cast in the query, such as `SELECT v::JSON`.
 
-| DuckDB type tag | Accepted Go values |
+DuckDB's `'infinity'` / `'-infinity'` dates and timestamps scan into `quackdriver.InfinityTime` / `NegInfinityTime` (5881580-07-11 and 5877642-06-24 BC UTC; compare with `Equal`). BC dates use astronomical year numbering, as DuckDB does: Go year 0 is 1 BC.
+
+`Rows.ColumnTypes()` reports `DatabaseTypeName` (e.g. `DECIMAL`, `TIMESTAMP WITH TIME ZONE`), `ScanType` and `DecimalSize`.
+
+### Write direction (Go → DuckDB via `Conn.Append` and `Appender`)
+
+Values are sent as text that the server casts to the column's type, so ranges and formats are DuckDB's.
+
+| DuckDB type | Accepted Go values |
 |---|---|
 | `BOOLEAN` | `bool` |
-| `TINYINT` … `BIGINT` | Any signed integer; widened, range-checked. |
-| `UTINYINT` … `UBIGINT` | Any unsigned integer; widened, range-checked. |
-| `HUGEINT`, `UHUGEINT` | `*big.Int`, `string` (base-10), or any integer. |
-| `FLOAT`, `DOUBLE` | `float32`, `float64`, `int` |
-| `VARCHAR` | `string`, `[]byte` |
-| `BLOB` | `[]byte`, `string` |
+| `TINYINT` … `BIGINT`, `UTINYINT` … `UBIGINT` | any Go integer |
+| `HUGEINT`, `UHUGEINT`, `BIGNUM` | any Go integer, `*big.Int`, `big.Int`, decimal string |
+| `FLOAT`, `DOUBLE` | any Go integer or float |
+| `DECIMAL(w, s)` | decimal string (DuckDB rounds extra digits), `*big.Int` / `big.Int` (unscaled), Go integer, float (multiplied by 10^s and rounded half away from zero exactly like DuckDB's `DOUBLE` → `DECIMAL` cast, so it stores what `INSERT ... VALUES (?)` stores) |
+| `VARCHAR`, `CHAR`, `JSON` | `string`, `[]byte` (valid UTF-8; a nil `[]byte` is NULL) |
+| `BLOB` | `[]byte` (a nil `[]byte` is NULL), `string` |
+| `BIT` | `string` of `0`/`1` |
 | `UUID` | `string` (8-4-4-4-12 hex) |
-| `DATE` | `time.Time` |
-| `TIMESTAMP*` | `time.Time` |
-| `INTERVAL` | `time.Duration` or `message.IntervalValue` |
-| `DECIMAL(w, s)` | `string`, `*big.Int`, numeric. Scale is auto-applied. |
-| `LIST(T)`, `T[]` | `[]any` |
-| `ARRAY<T, N>`, `T[N]` | `[]any` of exact length |
-| `STRUCT(name TYPE, ...)` | `map[string]any` keyed by field name |
-| `MAP(K, V)` | `map[string]any` (string keys) or `[]any` of `{"key", "value"}` |
-| `UNION(name TYPE, ...)` | `map[string]any` with **exactly one** non-nil variant |
-| Any column | `nil` for SQL NULL |
+| `DATE` | `time.Time` (its UTC date) |
+| `TIME`, `TIME_NS` | `time.Duration` in [0, 24h], or `time.Time` (its UTC time of day) |
+| `TIME WITH TIME ZONE` | `TimeTzValue`, or `time.Time` (its local time of day and offset) |
+| `TIMESTAMP*`, `TIMESTAMPTZ*` | `time.Time`; digits below the column's precision round to the nearest unit, halves away from the epoch, like DuckDB's own timestamp casts |
+| `INTERVAL` | `IntervalValue`, `time.Duration` |
+| `ENUM(...)` | `string` label or integer index |
+| `T[]` | `[]any` |
+| `T[N]` | `[]any` of exactly N elements |
+| `STRUCT(...)` | `map[string]any` (missing fields are NULL; unknown keys are errors) |
+| `TUPLE(...)` | `[]any`, one value per member |
+| `MAP(K, V)` | `map[string]any` (string keys, sent sorted) or `[]any` of `map[string]any{"key": k, "value": v}` |
+| any column | `nil` for NULL |
+
+UNION columns cannot be appended (DuckDB's cast from text picks the member itself), nor can VARIANT and GEOMETRY columns.
+
+## Errors and results
+
+- Server errors are `*quackdriver.Error` with DuckDB's exception `Type` (`"Catalog"`, `"Constraint"`, `"Parser"`, ...), `Message` and `ExtraInfo`:
+
+  ```go
+  var qe *quackdriver.Error
+  if errors.As(err, &qe) && qe.Type == "Constraint" { ... }
+  ```
+
+- A lost session (server restart, expired lease) yields `driver.ErrBadConn`, so `database/sql` retries on a fresh connection when the statement provably did not run.
+- `RowsAffected` reports DuckDB's changed-row count for `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `COPY` and `CREATE TABLE ... AS`, the number of returned rows for DML with a `RETURNING` clause, and 0 for other statements. For a query string with several statements it describes the one result the server returns (the first statement's that returns rows, otherwise the last one's), not a total. `LastInsertId` is not supported (use `INSERT ... RETURNING`).
+- A transaction statement (`BEGIN`, `COMMIT`, `ROLLBACK`) that fails without a definite answer (its `context` ended, or the connection broke after it was sent) discards the connection, because the session may be inside a transaction the driver no longer knows about.
+- When a `context` ends, the driver cancels the statement on the server and returns `ctx.Err()`; the next statement on the session waits until the cancellation has settled.
+- Closing `Rows` early cancels a read-only statement; other statements (e.g. `INSERT ... RETURNING`) are read to the end so their writes complete.
 
 ## Limitations & gotchas
 
-- **No server-side prepared statements.** Quack v1.5.3 doesn't expose a bind path. The driver substitutes parameters as SQL literals in `internal/sqlfmt` before sending. **Treat that package as the entire injection-defense surface** — any new types accepted by `FormatValue` must double-escape strings.
-- **`localhost` resolves to IPv6 first**; the server binds IPv4 only. Use `127.0.0.1` in DSNs and tests.
+- **No server-side bind.** Parameters are substituted client-side (see [Query parameters](#query-parameters)). New types accepted by `sqlfmt.FormatValue` must render injection-safe literals of the intended type.
+- **One statement at a time per session.** Starting a statement while a `Rows` of the same connection is still open first reads the rest of that result into memory (Quack aborts a statement when the next one is prepared), so iterating rows while running updates in a transaction works, at the cost of buffering. The buffer is bounded by the DSN's `max_buffered_rows` (default 1,000,000): beyond it the new statement fails with an error naming the parameter and the `Rows` keeps streaming; finish or close the `Rows` first, use another connection, or raise the bound.
+- **`DECIMAL(w, w)`** values decode as `"0.5"` where DuckDB renders `.5`; floats render as Go does (`NaN` vs DuckDB's `nan`).
+- **Server bind address.** `quack_serve('quack:127.0.0.1:9494')` binds IPv4 only while `localhost` may resolve to `::1` first; the examples use `127.0.0.1`.
 - **bun + `int64` columns** must be tagged `type:BIGINT` (see [bun ORM](#bun-orm)).
-- **FSST-compressed vectors** are rejected with a clear error. They appear when DuckDB enables them for `VARCHAR` columns; if you hit one, `CALL enable_logging('Quack')` server-side or cast the column to a different type.
-- **`TIME WITH TIME ZONE`** decodes to raw 64-bit bits — the offset packing in v1.5.3 isn't documented well enough to expose accessors safely. Cast to VARCHAR server-side for parsed display today.
-- **`LastInsertId` returns `ErrNoLastInsertID`**; `RowsAffected` returns `(0, nil)`. Quack does not transmit either today.
-- **Typed `Scan` for nested types** is not implemented yet — LIST/STRUCT/MAP/ARRAY come back as `[]any` / `map[string]any`. Use the [`Conn.Append`](#bulk-insert-with-connappend) high-level API to round-trip them.
+- **FSST-compressed vectors** are rejected with a clear error (the server has not been seen to send them).
+- **VARIANT** values are not decoded; cast them in the query (`v::JSON`).
+- **Typed `Scan` for nested types** is not implemented: LIST/STRUCT/MAP/ARRAY come back as `[]any` / `map[string]any`.
 
 ## Development
 
-The whole development loop runs locally — there is no CI yet.
-
 ```bash
-make test           # build + vet + go test + every example, auto-starts server
-make test-unit      # just `go test ./...` (no server needed)
-make test-examples  # just the example programs (auto-starts server)
-make test-bun       # bun ORM example (separate go.mod)
+make test              # unit tests (fake server in internal/quacktest; no DuckDB needed)
+make test-integration  # the unit tests plus `go test -tags integration ./...`: the tests start their own
+                       # DuckDB 2.0 servers, and integration/examples runs every example and checks its output
+make lint              # go vet + golangci-lint, as in CI
 
-make server         # start a Quack server in the foreground
-make server-bg      # start in the background; reuse if already up
-make stop           # kill whatever is listening on QUACK_PORT
-make bench          # APPEND vs INSERT throughput benchmark
-make dump-wire      # regenerate testdata/golden/*.bin
-make help           # all targets + variable values
+make server            # a Quack server in the foreground (scripts/start-quack-server.sh); Ctrl-C stops it
+make bench             # INSERT vs Conn.Append vs Appender throughput
+make dump-wire         # regenerate testdata/golden/*.bin
 ```
 
-The auto-managed server is conservative: if a server is already up on `QUACK_PORT` (default `9494`), `make test` reuses it and **never kills it**. Only servers `make` itself started are torn down.
+The test servers and `make server` run `DUCKDB_BIN` (default `duckdb` on `PATH`; the primary target is the official v2.0.0 release CLI) with `QUACK_TEST_INIT_SQL` in place of the default `INSTALL quack; LOAD quack;` before `quack_serve`. Without httpfs (for example when the extension repository is unreachable) `quack_serve` needs `force_mbedtls_unsafe` to generate its keys:
+
+```bash
+make test-integration DUCKDB_BIN=/path/to/duckdb QUACK_TEST_INIT_SQL="SET force_mbedtls_unsafe = 'true'; INSTALL quack; LOAD quack;"
+```
+
+`make bench` and `make dump-wire` use a server already answering on `QUACK_HOST:QUACK_PORT` (default `127.0.0.1:9494`) as is; otherwise `scripts/with-server.sh` starts one and stops it afterwards.
 
 ### Project layout
 
 ```
 quackdriver/
-├── quackdriver.go, conn.go, stmt.go, rows.go, tx.go, value.go   ← driver.* surface
-├── append.go, appendtype.go                                     ← high-level APPEND API
+├── quackdriver.go, connector.go, conn.go, stmt.go, rows.go, tx.go   ← driver.* surface
+├── fetch.go, heartbeat.go                                          ← FETCH read-ahead, session lease
+├── append.go, appender.go                                          ← Conn.Append, Appender
+├── errors.go, types.go, value.go, options.go
 ├── internal/
 │   ├── codec/       — BinarySerializer (ULEB/SLEB, object framing, hugeint)
-│   ├── logicaltype/ — DuckDB type system (LogicalType + ExtraInfo)
-│   ├── message/     — 10 Quack messages + DataChunk encode/decode
-│   ├── transport/   — URI parser + HTTP/2 client
-│   └── sqlfmt/      — SQL literal escaper (security-critical)
+│   ├── logicaltype/ — DuckDB type system (LogicalType + ExtraInfo, SQL rendering)
+│   ├── message/     — Quack v3 messages + DataChunk/vector encode/decode
+│   ├── value/       — IntervalValue, TimeTzValue, date/timestamp conversion
+│   ├── transport/   — DSN parser + HTTP/1.1 client (TLS, pinning)
+│   ├── sqlfmt/      — placeholder scanner + SQL literal rendering (security-critical)
+│   ├── quacktest/   — fake Quack server for unit tests
+│   └── livetest/    — starts real servers for the integration tests
+├── integration/     — integration tests against real DuckDB servers (-tags integration)
 ├── cmd/dump-wire/   — captures wire fixtures from a live server
+├── cmd/probe-fetch/ — runs and reports a FETCH loop by hand
 ├── testdata/golden/ — request/response byte fixtures (committed)
 ├── examples/        — runnable end-to-end programs
 └── doc/PROTOCOL.md  — wire-format cheat sheet
 ```
 
-The layering is strict and bottom-up: `codec` → `logicaltype` → `message` → `transport` → driver surface. New protocol knowledge belongs at the lowest layer that can host it.
+The layering is bottom-up: `codec` → `logicaltype` → `message` → `transport` → driver surface. New protocol knowledge belongs at the lowest layer that can host it.
 
 ### Adding wire fixtures
 
-`testdata/golden/*.bin` are **immutable** request/response byte captures from a known-good server, used by `go test ./internal/message/` to detect protocol drift without a live server. Regenerate when intentionally bumping the server version:
+`testdata/golden/*.bin` are request/response byte captures from the official DuckDB v2.0.0 release (see [`testdata/golden/README.md`](./testdata/golden/README.md)), used by `go test ./internal/message/` to detect protocol drift without a live server. Regenerate when intentionally bumping the server version:
 
 ```bash
 make dump-wire
@@ -305,29 +409,27 @@ git diff testdata/golden     # any byte change is a protocol drift — investiga
 
 Please include:
 
-1. The DuckDB server version (`SELECT version();` or the `quack_serve(...)` startup banner).
-2. The exact DSN and the SQL statement (or `Conn.Append` arguments) that triggered the issue.
+1. The DuckDB server version (`SELECT version();`).
+2. The exact DSN (without the token) and the SQL statement (or `Conn.Append` / `Appender` arguments) that triggered the issue.
 3. A `make dump-wire` capture (`testdata/golden/`) if the regression is wire-related.
 
 ## References
 
-The Quack protocol is alpha and the upstream docs are thin. These are the load-bearing references:
+There is no official Quack wire-protocol specification: DuckDB's documentation describes the protocol only at a high level, and its FAQ says the protocol is not yet stable. The de-facto schema is the duckdb-quack source.
 
 | Source | Use for |
 |---|---|
-| [`duckdb/duckdb-quack`](https://github.com/duckdb/duckdb-quack) — `src/include/quack_message.json` | Authoritative message schema (field IDs, types). |
-| [`tobilg/quack-protocol`](https://github.com/tobilg/quack-protocol) (TypeScript) | Cleanest algorithm reference — codec, logical types, vector encoding. |
-| [`gizmodata/quack-jdbc`](https://github.com/gizmodata/quack-jdbc) (Java) | Structural reference — the Java package layout mirrors this driver's `internal/` tree. |
-| [`tobilg`'s wire-format gist](https://gist.github.com/tobilg/9ced9d08f6141b723f26cf205d5b9ece) | Narrative protocol overview. |
-| [`Maxxen`'s BinarySerializer gist](https://gist.github.com/Maxxen/364d32444d3f1577e30705e72ee3b80e) | DuckDB `BinarySerializer` byte layout. |
-| [DuckDB docs — Quack overview](https://duckdb.org/docs/current/quack/overview) | Official user-facing protocol docs. |
-| Local: [`doc/PROTOCOL.md`](./doc/PROTOCOL.md) | Distilled wire-format cheat sheet (what this driver implements). |
+| [`duckdb/duckdb-quack`](https://github.com/duckdb/duckdb-quack) — `src/include/quack_message.json`, the generated `src/serialize_quack_message.cpp`, `src/quack_server.cpp` | Message schema and server behaviour. |
+| [DuckDB](https://github.com/duckdb/duckdb) — `src/common/serializer/`, `src/common/types/vector.cpp` | `BinarySerializer` and Vector/type serialization (`StorageVersion::V2_0_0`). |
+| [DuckDB docs — Quack overview](https://duckdb.org/docs/current/quack/overview) | High-level, user-facing description. |
+| [`tobilg/quack-protocol`](https://github.com/tobilg/quack-protocol) (TypeScript), [`gizmodata/quack-jdbc`](https://github.com/gizmodata/quack-jdbc) (Java) | Other client implementations. |
+| Local: [`doc/PROTOCOL.md`](./doc/PROTOCOL.md) | Distilled wire-format notes (what this driver implements). |
 
-This driver translates the TypeScript implementation's algorithms into Go, cross-checked against the Java structural conventions and verified byte-for-byte against the official server output (see `testdata/golden/`). It would not exist without those three upstream projects — credit and respect to their maintainers.
+Decoding and encoding are checked byte for byte against fixtures captured from the official DuckDB v2.0.0 release (`testdata/golden/`). Credit and respect to the maintainers of the upstream projects.
 
 ## Changelog
 
-See [CHANGELOG.md](./CHANGELOG.md). The current release is `v0.1.0-alpha.1`.
+See [CHANGELOG.md](./CHANGELOG.md).
 
 ## License
 
