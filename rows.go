@@ -3,30 +3,37 @@ package quackdriver
 import (
 	"context"
 	"database/sql/driver"
-	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"reflect"
+	"strings"
+	"time"
 
-	"github.com/zzir/quackdriver/internal/codec"
 	"github.com/zzir/quackdriver/internal/logicaltype"
 	"github.com/zzir/quackdriver/internal/message"
 )
 
-// Rows iterates over the result of a PREPARE_REQUEST. Additional chunks are
-// pulled via FETCH_REQUEST when needed.
+// Rows iterates over the result of a statement: first the chunks PREPARE
+// returned inline, then the FETCH batches (read ahead in the background, see
+// the fetch_ahead DSN parameter).
 type Rows struct {
-	conn       *Conn
-	ctx        context.Context
-	chunks     []message.DataChunk
-	chunkIdx   int
-	rowInChunk int
+	conn *Conn
+	q    *query
+	ctx  context.Context
 
 	columnNames []string
 	columnTypes []logicaltype.Type
-	resultUUID  codec.HugeInt
-	needsMore   bool
-	closed      bool
+
+	chunks []message.DataChunk // queue; chunks[0] is being read
+	row    int                 // next row of chunks[0]
+
+	// fetcher is nil once the stream is exhausted, buffered or failed. It
+	// is only cleared under conn.mu (takeFetcher), because Conn.Close reads
+	// it from another goroutine.
+	fetcher *fetcher
+	err     error // reported after the queued chunks
+	closed  bool
 }
 
 var (
@@ -34,75 +41,41 @@ var (
 	_ driver.RowsColumnTypeDatabaseTypeName = (*Rows)(nil)
 	_ driver.RowsColumnTypeNullable         = (*Rows)(nil)
 	_ driver.RowsColumnTypeScanType         = (*Rows)(nil)
+	_ driver.RowsColumnTypePrecisionScale   = (*Rows)(nil)
 )
 
-func newRows(ctx context.Context, c *Conn, prep message.PrepareResponse) *Rows {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return &Rows{
-		conn:        c,
+func newRows(ctx context.Context, q *query) *Rows {
+	r := &Rows{
+		conn:        q.conn,
+		q:           q,
 		ctx:         ctx,
-		chunks:      prep.Results,
-		columnNames: prep.ResultNames,
-		columnTypes: prep.ResultTypes,
-		resultUUID:  prep.ResultUUID,
-		needsMore:   prep.NeedsMoreFetch,
+		columnNames: q.prep.ResultNames,
+		columnTypes: q.prep.ResultTypes,
+		chunks:      q.prep.Results,
 	}
+	if q.prep.NeedsMoreFetch {
+		r.fetcher = q.newFetcher(q.conn.uri.FetchAhead)
+		r.fetcher.topUp(r.fetcher.depth) // start the read-ahead
+	}
+	return r
 }
 
 // Columns returns the result column names.
 func (r *Rows) Columns() []string { return r.columnNames }
 
-// Close releases the result. If the caller closes mid-iteration while the
-// server still has pending chunks (`needsMore`), Close drains them via
-// follow-up FETCH_REQUESTs so the server-side result buffer is freed; without
-// this, the result UUID would dangle until the connection is closed.
-//
-// Drain errors are returned but the Rows is always marked closed so a second
-// Close is a cheap no-op. A canceled context (typical during graceful
-// shutdown) is not surfaced as an error.
-func (r *Rows) Close() error {
-	if r.closed {
-		return nil
-	}
-	r.closed = true
-	drainErr := r.drain()
-	r.chunks = nil
-	if drainErr != nil && !errors.Is(drainErr, context.Canceled) && !errors.Is(drainErr, context.DeadlineExceeded) {
-		return drainErr
-	}
-	return nil
-}
-
-// drain pulls FETCH_REQUESTs until the server signals exhaustion with an
-// empty result list. Called from Close; safe to call on an already-exhausted
-// Rows (it returns immediately).
-func (r *Rows) drain() error {
-	for r.needsMore {
-		if err := r.fetchMore(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// Next reads the next row into dest. dest is pre-sized by database/sql to
-// len(Columns()). We defensively guard against a misbehaving server that
-// could send a chunk whose column or row counts do not match what was
-// promised in the PrepareResponse — without this, a short Columns slice or
-// short column vector would crash the client with an index-out-of-range
-// panic deep inside the standard library.
+// Next reads the next row into dest. A malformed chunk (fewer columns or
+// rows than announced) is reported as an error instead of a panic.
 func (r *Rows) Next(dest []driver.Value) error {
 	if r.closed {
 		return io.EOF
 	}
 	for {
-		if r.chunkIdx < len(r.chunks) {
-			chunk := r.chunks[r.chunkIdx]
-			if r.rowInChunk >= chunk.RowCount {
-				r.chunkIdx++
-				r.rowInChunk = 0
+		for len(r.chunks) > 0 {
+			chunk := &r.chunks[0]
+			if r.row >= chunk.RowCount {
+				r.chunks[0] = message.DataChunk{}
+				r.chunks = r.chunks[1:]
+				r.row = 0
 				continue
 			}
 			if len(chunk.Columns) < len(dest) {
@@ -110,90 +83,241 @@ func (r *Rows) Next(dest []driver.Value) error {
 			}
 			for col := range dest {
 				column := chunk.Columns[col]
-				if r.rowInChunk >= len(column) {
+				if column == nil || r.row >= column.Len() {
+					n := 0
+					if column != nil {
+						n = column.Len()
+					}
 					return fmt.Errorf("quackdriver: column %d has %d rows but chunk declared %d (row index %d)",
-						col, len(column), chunk.RowCount, r.rowInChunk)
+						col, n, chunk.RowCount, r.row)
 				}
-				dest[col] = column[r.rowInChunk]
+				dest[col] = column.Value(r.row)
 			}
-			r.rowInChunk++
+			r.row++
 			return nil
 		}
-		if !r.needsMore {
+		if r.fetcher == nil {
+			if r.err != nil {
+				return r.err
+			}
 			return io.EOF
 		}
-		if err := r.fetchMore(); err != nil {
+		chunks, end, err := r.fetcher.next(r.ctx)
+		if end {
+			r.takeFetcher()
+			continue
+		}
+		if err != nil {
+			r.takeFetcher()
+			if interrupted(r.ctx, err) {
+				r.q.cancelAsync()
+			}
+			r.err = err
 			return err
+		}
+		r.chunks = chunks
+		r.row = 0
+	}
+}
+
+// takeFetcher clears r.fetcher and the connection's active Rows (when it is
+// r) in one critical section, and returns the fetcher it held.
+func (r *Rows) takeFetcher() *fetcher {
+	c := r.conn
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	f := r.fetcher
+	r.fetcher = nil
+	if c.active == r {
+		c.active = nil
+	}
+	return f
+}
+
+// buffer reads the remaining batches into memory, because a new statement
+// is about to replace this one on the server. A failure is kept and
+// reported by Next after the rows read so far. With limit > 0, buffering
+// stops once more than limit rows are queued: the stream is kept (the Rows
+// stays readable and active) and an error for the new statement is
+// returned.
+func (r *Rows) buffer(ctx context.Context, limit int) error {
+	f := r.takeFetcher()
+	if f == nil {
+		return nil
+	}
+	for {
+		chunks, end, err := f.next(ctx)
+		if end {
+			return nil
+		}
+		if err != nil {
+			if interrupted(ctx, err) {
+				r.q.cancelAsync()
+			}
+			r.err = err
+			return nil
+		}
+		r.chunks = append(r.chunks, chunks...)
+		if limit > 0 && rowCount(r.chunks)-r.row > limit {
+			r.keepFetcher(f)
+			return fmt.Errorf("quackdriver: cannot start a statement while an earlier result of this connection "+
+				"still has more than %d unread rows on the server (max_buffered_rows); read or close that Rows first, "+
+				"or raise max_buffered_rows in the DSN", limit)
 		}
 	}
 }
 
-func (r *Rows) fetchMore() error {
-	_, body, err := r.conn.roundTrip(r.ctx, message.FetchRequest{ResultUUID: r.resultUUID})
-	if err != nil {
-		return err
+// keepFetcher reattaches f to r (and r as the connection's active Rows),
+// undoing takeFetcher.
+func (r *Rows) keepFetcher(f *fetcher) {
+	c := r.conn
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	r.fetcher = f
+	c.active = r
+}
+
+// Close releases the result. Closing before the end stops the read-ahead
+// and, for read-only statements (SELECT, FROM, VALUES, TABLE, SHOW,
+// DESCRIBE, SUMMARIZE, EXPLAIN, PRAGMA, or a WITH leading to one of them),
+// cancels the statement on the server unless it already finished there;
+// read-ahead requests still in flight are then left to complete, which
+// keeps their connections in the pool. Other statements, such as
+// INSERT ... RETURNING, are drained instead so their writes complete; a
+// failure while draining is returned. If the query's context has ended, the
+// statement is cancelled.
+func (r *Rows) Close() error {
+	if r.closed {
+		return nil
 	}
-	resp, ok := body.(message.FetchResponse)
-	if !ok {
-		return fmt.Errorf("quackdriver: unexpected response %T to FETCH", body)
+	r.closed = true
+	f := r.takeFetcher()
+	r.chunks = nil
+	if f == nil {
+		return nil
 	}
-	r.chunks = append(r.chunks[:0], resp.Results...)
-	r.chunkIdx = 0
-	r.rowInChunk = 0
-	// The server signals exhaustion by returning an empty results list.
-	// batchIndex is purely informational and must not be used for termination
-	// (it can be absent on legitimate non-final batches).
-	r.needsMore = len(resp.Results) > 0
+	if r.ctx.Err() == nil && !r.q.info.readOnly {
+		for {
+			_, end, err := f.next(r.ctx)
+			if end {
+				return nil
+			}
+			if err != nil {
+				if interrupted(r.ctx, err) {
+					r.q.cancel()
+					return nil
+				}
+				return err
+			}
+		}
+	}
+	f.abandon(errRowsClosed)
 	return nil
 }
 
-// ColumnTypeDatabaseTypeName returns the DuckDB type name for column index.
+// ColumnTypeDatabaseTypeName returns the DuckDB type name of a column, e.g.
+// "INTEGER", "DECIMAL", "TIMESTAMP WITH TIME ZONE", or the alias for aliased
+// types such as "JSON".
 func (r *Rows) ColumnTypeDatabaseTypeName(index int) string {
 	if index < 0 || index >= len(r.columnTypes) {
 		return ""
 	}
-	return r.columnTypes[index].Name()
+	t := r.columnTypes[index]
+	if t.Info != nil && t.Info.Alias != "" {
+		return strings.ToUpper(t.Info.Alias)
+	}
+	return t.Name()
 }
 
-// ColumnTypeNullable always reports true — Quack columns are nullable by default.
+// ColumnTypeNullable reports every column as nullable: Quack does not
+// transfer nullability.
 func (r *Rows) ColumnTypeNullable(int) (nullable, ok bool) { return true, true }
 
-// ColumnTypeScanType returns a representative Go type for scanning.
+// ColumnTypePrecisionScale returns the width and scale of DECIMAL columns.
+func (r *Rows) ColumnTypePrecisionScale(index int) (precision, scale int64, ok bool) {
+	if index < 0 || index >= len(r.columnTypes) {
+		return 0, 0, false
+	}
+	t := r.columnTypes[index]
+	if t.ID != logicaltype.IDDecimal || t.Info == nil {
+		return 0, 0, false
+	}
+	return int64(t.Info.Width), int64(t.Info.Scale), true
+}
+
+// ColumnTypeScanType returns the Go type of the values a column yields.
 func (r *Rows) ColumnTypeScanType(index int) reflect.Type {
 	if index < 0 || index >= len(r.columnTypes) {
-		return reflect.TypeOf((*any)(nil)).Elem()
+		return reflect.TypeFor[any]()
 	}
 	return scanTypeFor(r.columnTypes[index])
 }
 
+// scanTypeFor maps a logical type to the Go type its decoded values have.
 func scanTypeFor(t logicaltype.Type) reflect.Type {
 	switch t.ID {
 	case logicaltype.IDBoolean:
-		return reflect.TypeOf(false)
+		return reflect.TypeFor[bool]()
 	case logicaltype.IDTinyint:
-		return reflect.TypeOf(int8(0))
+		return reflect.TypeFor[int8]()
 	case logicaltype.IDSmallint:
-		return reflect.TypeOf(int16(0))
+		return reflect.TypeFor[int16]()
 	case logicaltype.IDInteger:
-		return reflect.TypeOf(int32(0))
+		return reflect.TypeFor[int32]()
 	case logicaltype.IDBigint:
-		return reflect.TypeOf(int64(0))
+		return reflect.TypeFor[int64]()
 	case logicaltype.IDUTinyint:
-		return reflect.TypeOf(uint8(0))
+		return reflect.TypeFor[uint8]()
 	case logicaltype.IDUSmallint:
-		return reflect.TypeOf(uint16(0))
+		return reflect.TypeFor[uint16]()
 	case logicaltype.IDUInteger:
-		return reflect.TypeOf(uint32(0))
+		return reflect.TypeFor[uint32]()
 	case logicaltype.IDUBigint:
-		return reflect.TypeOf(uint64(0))
+		return reflect.TypeFor[uint64]()
+	case logicaltype.IDHugeint, logicaltype.IDUHugeint, logicaltype.IDBignum:
+		return reflect.TypeFor[*big.Int]()
 	case logicaltype.IDFloat:
-		return reflect.TypeOf(float32(0))
+		return reflect.TypeFor[float32]()
 	case logicaltype.IDDouble:
-		return reflect.TypeOf(float64(0))
-	case logicaltype.IDVarchar, logicaltype.IDChar, logicaltype.IDUUID:
-		return reflect.TypeOf("")
-	case logicaltype.IDBlob, logicaltype.IDBit, logicaltype.IDGeometry:
-		return reflect.TypeOf([]byte(nil))
+		return reflect.TypeFor[float64]()
+	case logicaltype.IDDecimal, logicaltype.IDVarchar, logicaltype.IDChar, logicaltype.IDUUID,
+		logicaltype.IDBit, logicaltype.IDEnum:
+		return reflect.TypeFor[string]()
+	case logicaltype.IDBlob, logicaltype.IDGeometry, logicaltype.IDAggregateState:
+		return reflect.TypeFor[[]byte]()
+	case logicaltype.IDDate, logicaltype.IDTimestamp, logicaltype.IDTimestampSec, logicaltype.IDTimestampMs,
+		logicaltype.IDTimestampNs, logicaltype.IDTimestampTz, logicaltype.IDTimestampTzNs:
+		return reflect.TypeFor[time.Time]()
+	case logicaltype.IDTime, logicaltype.IDTimeNs:
+		return reflect.TypeFor[time.Duration]()
+	case logicaltype.IDTimeTz:
+		return reflect.TypeFor[TimeTzValue]()
+	case logicaltype.IDInterval:
+		return reflect.TypeFor[IntervalValue]()
+	case logicaltype.IDList, logicaltype.IDArray, logicaltype.IDMap, logicaltype.IDTuple:
+		return reflect.TypeFor[[]any]()
+	case logicaltype.IDStruct:
+		if positionalStruct(t) {
+			return reflect.TypeFor[[]any]()
+		}
+		return reflect.TypeFor[map[string]any]()
+	case logicaltype.IDUnion:
+		return reflect.TypeFor[map[string]any]()
 	}
-	return reflect.TypeOf((*any)(nil)).Elem()
+	// SQLNULL and anything unexpected.
+	return reflect.TypeFor[any]()
+}
+
+// positionalStruct reports a STRUCT whose children are all unnamed; it is
+// decoded positionally like a TUPLE.
+func positionalStruct(t logicaltype.Type) bool {
+	if t.Info == nil || len(t.Info.Children) == 0 {
+		return false
+	}
+	for _, c := range t.Info.Children {
+		if c.Name != "" {
+			return false
+		}
+	}
+	return true
 }

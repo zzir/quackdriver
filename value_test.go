@@ -1,38 +1,108 @@
 package quackdriver
 
 import (
+	"database/sql/driver"
+	"errors"
 	"math"
+	"math/big"
 	"testing"
+	"time"
 )
 
-// Regression: converting a uint that doesn't fit in int64 used to silently
-// wrap to a negative int64, which the sqlfmt layer would then render as a
-// negative SQL literal — silent data corruption.
-func TestConvertValueLargeUintPassesThrough(t *testing.T) {
-	v, err := convertValue(uint(math.MaxUint64))
-	if err != nil {
-		t.Fatal(err)
+type intervalValuer struct{ iv IntervalValue }
+
+func (v intervalValuer) Value() (driver.Value, error) { return v.iv, nil }
+
+type ptrValuer struct{ s string }
+
+func (v *ptrValuer) Value() (driver.Value, error) { return v.s, nil }
+
+type failingValuer struct{}
+
+func (failingValuer) Value() (driver.Value, error) { return nil, errors.New("no value") }
+
+type loopValuer struct{}
+
+func (loopValuer) Value() (driver.Value, error) { return loopValuer{}, nil }
+
+type myInt int16
+
+func TestConvertValueTypes(t *testing.T) {
+	tz, _ := NewTimeTz(time.Hour, 0)
+	bi := big.NewInt(5)
+	now := time.Now()
+	cases := []struct {
+		in, want any
+	}{
+		{nil, nil},
+		{true, true},
+		{int(-3), int64(-3)},
+		{int8(-3), int64(-3)},
+		{int16(-3), int64(-3)},
+		{int32(-3), int64(-3)},
+		{int64(-3), int64(-3)},
+		{uint8(3), int64(3)},
+		{uint16(3), int64(3)},
+		{uint32(3), int64(3)},
+		{uint64(math.MaxUint64), uint64(math.MaxUint64)},
+		// A uint above MaxInt64 must not wrap to a negative int64.
+		{uint(math.MaxInt64), int64(math.MaxInt64)},
+		{uint(math.MaxInt64) + 1, uint64(math.MaxInt64) + 1},
+		{uint(math.MaxUint64), uint64(math.MaxUint64)},
+		{float32(1.5), float64(1.5)},
+		{2.5, 2.5},
+		{"s", "s"},
+		{now, now},
+		{90 * time.Minute, 90 * time.Minute},
+		{IntervalValue{Months: 1}, IntervalValue{Months: 1}},
+		{tz, tz},
+		{bi, bi},
+		{intervalValuer{IntervalValue{Days: 2}}, IntervalValue{Days: 2}},
+		{&ptrValuer{"p"}, "p"},
+		{(*ptrValuer)(nil), nil},
+		{myInt(7), int64(7)},
 	}
-	if got, ok := v.(uint64); !ok || got != math.MaxUint64 {
-		t.Fatalf("uint(MaxUint64) → uint64(MaxUint64), got %T %v", v, v)
+	for _, c := range cases {
+		got, err := convertValue(c.in)
+		if err != nil {
+			t.Errorf("%T: %v", c.in, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("%T %v: got %T %v, want %T %v", c.in, c.in, got, got, c.want, c.want)
+		}
+	}
+	if got, err := convertValue([]byte{1}); err != nil || got.([]byte)[0] != 1 {
+		t.Errorf("[]byte: %v %v", got, err)
+	}
+	r := big.NewRat(1, 3)
+	if got, err := convertValue(r); err != nil || got != r {
+		t.Errorf("*big.Rat: %v %v", got, err)
+	}
+	if _, err := convertValue(failingValuer{}); err == nil {
+		t.Error("Valuer error must propagate")
+	}
+	if _, err := convertValue(loopValuer{}); err == nil {
+		t.Error("endless Valuer chain must fail")
+	}
+	if _, err := convertValue(struct{}{}); err == nil {
+		t.Error("struct must be rejected")
+	}
+	nv := driver.NamedValue{Value: int32(4)}
+	if err := (&Conn{}).CheckNamedValue(&nv); err != nil || nv.Value != int64(4) {
+		t.Errorf("CheckNamedValue: %v %v", nv.Value, err)
 	}
 }
 
-func TestConvertValueUintMaxInt64Boundary(t *testing.T) {
-	// uint(MaxInt64) still fits in int64; should normalize to int64.
-	v, err := convertValue(uint(math.MaxInt64))
+func TestNewTimeTz(t *testing.T) {
+	tz, err := NewTimeTz(13*time.Hour+30*time.Minute, -3600)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, ok := v.(int64); !ok || got != math.MaxInt64 {
-		t.Fatalf("uint(MaxInt64) → int64(MaxInt64), got %T %v", v, v)
+	if tz.TimeOfDay() != 13*time.Hour+30*time.Minute || tz.OffsetSeconds() != -3600 {
+		t.Fatalf("%v %d", tz.TimeOfDay(), tz.OffsetSeconds())
 	}
-	// uint(MaxInt64+1) is the smallest uint that does NOT fit in int64.
-	v, err = convertValue(uint(math.MaxInt64) + 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, ok := v.(uint64); !ok || got != uint64(math.MaxInt64)+1 {
-		t.Fatalf("uint(MaxInt64+1) → uint64(MaxInt64+1), got %T %v", v, v)
+	if _, err := NewTimeTz(25*time.Hour, 0); err == nil {
+		t.Fatal("out-of-range time must fail")
 	}
 }

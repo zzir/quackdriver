@@ -19,7 +19,7 @@ var (
 	_ driver.StmtQueryContext = (*Stmt)(nil)
 )
 
-// Close is a no-op — there is no server-side state to release.
+// Close is a no-op: there is no server-side state to release.
 func (s *Stmt) Close() error { return nil }
 
 // NumInput tells database/sql to skip its own placeholder validation

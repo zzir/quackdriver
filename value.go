@@ -4,12 +4,14 @@ import (
 	"database/sql/driver"
 	"math"
 	"math/big"
+	"reflect"
 	"time"
 )
 
-// CheckNamedValue accepts any Go scalar plus a few common stdlib types. It is
-// used by database/sql to validate that a value is convertible to driver.Value
-// before the driver attempts to format it.
+// CheckNamedValue accepts Go scalars, the standard time types, big numbers
+// and the driver's own value types. The values are later rendered as SQL
+// literals (Quack carries only SQL text); see the README for the literal
+// each type becomes.
 func (c *Conn) CheckNamedValue(nv *driver.NamedValue) error {
 	v, err := convertValue(nv.Value)
 	if err != nil {
@@ -21,11 +23,20 @@ func (c *Conn) CheckNamedValue(nv *driver.NamedValue) error {
 
 var _ driver.NamedValueChecker = (*Conn)(nil)
 
+// maxValuerDepth bounds driver.Valuer chains (a Valuer returning a Valuer).
+const maxValuerDepth = 8
+
 func convertValue(v any) (driver.Value, error) {
+	return convertValueDepth(v, 0)
+}
+
+func convertValueDepth(v any, depth int) (driver.Value, error) {
 	switch x := v.(type) {
 	case nil:
 		return nil, nil
 	case bool, int64, float64, string, []byte, time.Time:
+		return x, nil
+	case time.Duration, IntervalValue, TimeTzValue:
 		return x, nil
 	case int:
 		return int64(x), nil
@@ -57,8 +68,29 @@ func convertValue(v any) (driver.Value, error) {
 		return float64(x), nil
 	case *big.Int, big.Int, *big.Rat:
 		return x, nil
+	case driver.Valuer:
+		// Resolve Valuers here: the default converter below would reject
+		// the driver's own types (IntervalValue, ...) a Valuer may return.
+		if depth >= maxValuerDepth {
+			break
+		}
+		if isNilPointer(x) {
+			return nil, nil
+		}
+		inner, err := x.Value()
+		if err != nil {
+			return nil, err
+		}
+		return convertValueDepth(inner, depth+1)
 	}
-	// Fall back to database/sql's default conversion, which understands the
-	// driver.Valuer interface and a handful of additional types.
+	// Fall back to database/sql's default conversion, which handles
+	// pointers and named types with a scalar underlying type.
 	return driver.DefaultParameterConverter.ConvertValue(v)
+}
+
+// isNilPointer reports a nil pointer stored in an interface, e.g. a nil
+// *MyValuer: database/sql's default converter treats those as NULL too.
+func isNilPointer(v any) bool {
+	rv := reflect.ValueOf(v)
+	return rv.Kind() == reflect.Pointer && rv.IsNil()
 }
