@@ -1,10 +1,15 @@
-// bun integration smoke test.
+// bun ORM on top of quackdriver (database/sql), using bun's SQLite dialect,
+// whose SQL DuckDB accepts.
 //
-//	# In one terminal:
+//	# In one terminal (DuckDB 2.0+ with the quack extension):
 //	bash ../../scripts/start-quack-server.sh
 //
-//	# In examples/bun:
+//	# In examples/bun (its own module, so bun stays out of the driver's
+//	# dependencies):
 //	go run .
+//
+// The server address comes from QUACK_HOST, QUACK_PORT and QUACK_TOKEN
+// (default 127.0.0.1:9494, token super_secret), or from a full QUACK_DSN.
 package main
 
 import (
@@ -12,6 +17,8 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"net"
+	"net/url"
 	"os"
 
 	"github.com/uptrace/bun"
@@ -33,11 +40,7 @@ type User struct {
 }
 
 func main() {
-	token := os.Getenv("QUACK_TOKEN")
-	if token == "" {
-		token = "super_secret"
-	}
-	sqldb, err := sql.Open("quack", "quack://127.0.0.1:9494?token="+token)
+	sqldb, err := sql.Open("quack", dsn())
 	if err != nil {
 		log.Fatalf("open: %v", err)
 	}
@@ -84,9 +87,27 @@ func main() {
 		fmt.Printf("  %d %s\n", u.ID, u.Name)
 	}
 
-	// Update.
-	if _, err := db.NewUpdate().Model(&User{ID: 2, Name: "bob", Active: true}).WherePK().Exec(ctx); err != nil {
+	// Update: bun reads RowsAffected from the driver.
+	res, err := db.NewUpdate().Model(&User{ID: 2, Name: "bob", Active: true}).WherePK().Exec(ctx)
+	if err != nil {
 		log.Fatalf("update: %v", err)
+	}
+	n, _ := res.RowsAffected()
+	fmt.Printf("updated %d row(s)\n", n)
+
+	// Transaction: delete and insert atomically.
+	err = db.RunInTx(ctx, nil, func(ctx context.Context, tx bun.Tx) error {
+		res, err := tx.NewDelete().Model((*User)(nil)).Where("name = ?", "carol").Exec(ctx)
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		fmt.Printf("deleted %d row(s) in a transaction\n", n)
+		_, err = tx.NewInsert().Model(&User{ID: 4, Name: "dave", Active: true}).Exec(ctx)
+		return err
+	})
+	if err != nil {
+		log.Fatalf("tx: %v", err)
 	}
 
 	// Count.
@@ -95,4 +116,21 @@ func main() {
 		log.Fatalf("count: %v", err)
 	}
 	fmt.Printf("active count: %d\n", cnt)
+}
+
+// dsn returns QUACK_DSN when set, else a DSN built from QUACK_HOST,
+// QUACK_PORT and QUACK_TOKEN (default 127.0.0.1:9494, token super_secret).
+func dsn() string {
+	if d := os.Getenv("QUACK_DSN"); d != "" {
+		return d
+	}
+	return "quack://" + net.JoinHostPort(env("QUACK_HOST", "127.0.0.1"), env("QUACK_PORT", "9494")) +
+		"?token=" + url.QueryEscape(env("QUACK_TOKEN", "super_secret"))
+}
+
+func env(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
