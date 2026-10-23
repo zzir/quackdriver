@@ -354,7 +354,7 @@ UNION columns cannot be appended (DuckDB's cast from text picks the member itsel
 make test              # unit tests (fake server in internal/quacktest; no DuckDB needed)
 make test-integration  # the unit tests plus `go test -tags integration ./...`: the tests start their own
                        # DuckDB 2.0 servers, and integration/examples runs every example and checks its output
-make lint              # go vet + golangci-lint, as in CI
+make lint              # go vet + golangci-lint with the versions CI uses (.tool-versions)
 
 make server            # a Quack server in the foreground (scripts/start-quack-server.sh); Ctrl-C stops it
 make bench             # INSERT vs Conn.Append vs Appender throughput
@@ -368,6 +368,8 @@ make test-integration DUCKDB_BIN=/path/to/duckdb QUACK_TEST_INIT_SQL="SET force_
 ```
 
 `make bench` and `make dump-wire` use a server already answering on `QUACK_HOST:QUACK_PORT` (default `127.0.0.1:9494`) as is; otherwise `scripts/with-server.sh` starts one and stops it afterwards.
+
+`.tool-versions` pins the Go and golangci-lint that lint the code, locally and in CI; `make lint` refuses other versions (`mise install` or `asdf install` installs these). The tests themselves run on the oldest supported Go and on the latest one. Dependabot keeps the GitHub Actions and the bun example's dependencies current; the weekly `canary` workflow lints with the newest Go and golangci-lint and turns red when a Go release calls for bumping `.tool-versions` or the minimum Go version.
 
 ### Project layout
 

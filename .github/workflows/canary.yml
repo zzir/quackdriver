@@ -1,0 +1,52 @@
+name: canary
+
+# A weekly look ahead, off the pull-request path. Red means a pinned version
+# is due for a bump, in a pull request:
+#   lint-latest  the newest Go and golangci-lint find something (or cannot
+#                run together yet): fix it, then bump .tool-versions.
+#   versions     a new Go release is out: bump golang in .tool-versions (with
+#                a golangci-lint built by it) and raise go.mod's go line to
+#                the oldest Go release still supported upstream.
+on:
+  schedule:
+    - cron: '17 3 * * 1' # Mondays 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-latest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
+
+  versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: Pinned Go versions track Go releases
+        run: |
+          minor() { v=${1#go}; v=${v#1.}; echo "${v%%.*}"; }
+          stable=$(minor "$(go env GOVERSION)")
+          tools=$(minor "$(awk '$1 == "golang" {print $2}' .tool-versions)")
+          floor=$(minor "$(awk '$1 == "go" {print $2}' go.mod)")
+          ok=true
+          if [ "$tools" -lt "$stable" ]; then
+            echo "::error file=.tool-versions::golang is 1.$tools but Go 1.$stable is out: bump it, with a golangci-lint built by Go 1.$stable"
+            ok=false
+          fi
+          if [ "$floor" -lt $((stable - 1)) ]; then
+            echo "::error file=go.mod::go 1.$floor is no longer supported upstream: raise it to 1.$((stable - 1))"
+            ok=false
+          fi
+          $ok

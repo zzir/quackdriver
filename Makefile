@@ -25,8 +25,19 @@ test:
 test-integration:
 	go test -count=1 -tags integration ./...
 
-# What CI runs besides the tests.
+# What CI runs besides the tests, with the Go and golangci-lint versions CI
+# uses (.tool-versions), so that a pass here is a pass there. `mise install`
+# installs them; otherwise bump .tool-versions in a pull request.
 lint:
+	@go_want=$$(awk '$$1 == "golang" {print $$2}' .tool-versions); \
+	lint_want=$$(awk '$$1 == "golangci-lint" {print $$2}' .tool-versions); \
+	go_have=$$(go env GOVERSION); go_have=$${go_have#go}; \
+	lint_have=$$(golangci-lint version --short 2>/dev/null || echo none); \
+	if [ "$${go_have%.*}" != "$${go_want%.*}" ] || [ "$$lint_have" != "$$lint_want" ]; then \
+		echo "make lint: .tool-versions (used by CI) says Go $$go_want and golangci-lint $$lint_want;"; \
+		echo "found Go $$go_have and golangci-lint $$lint_have."; \
+		exit 1; \
+	fi
 	go vet ./...
 	golangci-lint run ./...
 

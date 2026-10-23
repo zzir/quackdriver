@@ -1,0 +1,4 @@
+# Go and golangci-lint for `make lint` and CI's lint job (asdf/mise format).
+# Bump them together, in a pull request; .github/workflows/canary.yml says when.
+golang 1.27.3
+golangci-lint 2.15.0
