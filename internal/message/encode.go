@@ -15,12 +15,19 @@ import (
 // WriteProperty ones are always present, WritePropertyWithDefault ones are
 // omitted when they hold their default, so a request encodes to the bytes
 // the official client sends.
-func Encode(h Header, body Body) ([]byte, error) {
+func Encode(h Header, body Body) ([]byte, error) { return EncodeSize(h, body, 0) }
+
+// EncodeSize is Encode with a hint of the message's encoded size: the output
+// buffer starts with that capacity, so a hint at or a little above the final
+// size saves the copies a growing buffer makes (a 32 MiB SEND_DATA request
+// otherwise copies its bytes several times over). A hint that is too small
+// only costs those copies; 0 is no hint.
+func EncodeSize(h Header, body Body, sizeHint int) ([]byte, error) {
 	if body == nil {
 		return nil, fmt.Errorf("message: nil body")
 	}
 	h.Type = body.MessageType()
-	w := codec.NewWriter()
+	w := codec.NewWriterSize(sizeHint)
 	if err := encodeHeader(w, h); err != nil {
 		return nil, err
 	}

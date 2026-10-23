@@ -361,3 +361,35 @@ func TestAppenderConcurrentUse(t *testing.T) {
 		t.Fatal("rows lost")
 	}
 }
+
+// A sealed chunk carries the Appender's size estimate for its rows (1 per
+// value, the text plus 4 per string), which sizes the request buffer; a
+// split shares the estimate between the halves.
+func TestPendingChunkBytes(t *testing.T) {
+	s := newServer(t)
+	c := openConn(t, s)
+	a := newAppender(t, c, bigintCol)
+	for i := range 10 {
+		if err := a.AppendRow(int64(1000 + i)); err != nil { // "1000".."1009": 9 bytes each
+			t.Fatal(err)
+		}
+	}
+	a.mu.Lock()
+	a.sealChunk()
+	pending := a.pending
+	a.mu.Unlock()
+	if len(pending) != 1 || pending[0].bytes != 90 || pending[0].chunk.RowCount != 10 {
+		t.Fatalf("pending %+v", pending)
+	}
+	left, right := splitChunk(pending[0])
+	if left.bytes != 45 || right.bytes != 45 || left.chunk.RowCount != 5 || right.chunk.RowCount != 5 {
+		t.Fatalf("split %d/%d bytes, %d/%d rows", left.bytes, right.bytes, left.chunk.RowCount, right.chunk.RowCount)
+	}
+	odd := pendingChunk{chunk: pending[0].chunk, bytes: 91}
+	if l, r := splitChunk(odd); l.bytes+r.bytes != 91 {
+		t.Fatalf("odd split %d+%d", l.bytes, r.bytes)
+	}
+	if err := a.Abort(); err != nil {
+		t.Fatal(err)
+	}
+}

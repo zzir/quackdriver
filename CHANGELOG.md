@@ -25,6 +25,10 @@ Rewrite for Quack protocol **v3** (DuckDB 2.0). This is a breaking upgrade: Duck
 - An empty `ssl_fingerprint=` is rejected like any other malformed value instead of silently disabling the pin.
 - A connection that gets no answer from the server for a whole heartbeat lease is marked gone (the server has expired the session by then) instead of retrying heartbeats forever; `database/sql` then replaces it.
 
+### Changed
+
+- `Conn.Append` and the `Appender` encode each `SEND_DATA` request into a buffer sized from their running estimate of the buffered rows and write the string data straight into it, instead of growing the buffer (and copying it) as they go. About half as much memory is allocated per request: a 2,000,000-row load into 11 TIMESTAMP/DECIMAL/BIGINT columns allocated 3.2 GiB instead of 6.6 GiB and ran about 10% faster. The bytes sent are unchanged.
+
 ### Added
 
 - DSN parameter `max_buffered_rows` (default 1,000,000): the most rows of an open `Rows` buffered in memory when another statement starts on its connection; beyond it the new statement fails and the `Rows` stays readable.

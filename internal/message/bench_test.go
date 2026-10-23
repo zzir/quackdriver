@@ -2,6 +2,7 @@ package message
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -120,6 +121,80 @@ func BenchmarkEncodeMixed(b *testing.B) {
 	b.ReportAllocs()
 	for range b.N {
 		if _, err := Encode(Header{}, body); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// benchSendData is a SEND_DATA request the way the Appender sends one: 16
+// chunks of 2048 rows, eleven VARCHAR columns holding the text of
+// timestamps, decimals and integers, a NULL per column and chunk.
+func benchSendData() (Header, SendDataRequest, int) {
+	const cols, rows, chunks = 11, 2048, 16
+	types := make([]logicaltype.Type, cols)
+	for i := range types {
+		types[i] = logicaltype.Type{ID: logicaltype.IDVarchar}
+	}
+	req := SendDataRequest{StreamID: "bench-stream", BatchIndex: Idx(1)}
+	estimate := 0 // what Appender.curBytes counts: 1 per value, len+4 per string
+	for c := range chunks {
+		dc := DataChunk{RowCount: rows, Types: types, Columns: make([]Column, cols)}
+		for j := range cols {
+			vals := make(Values, rows)
+			for r := range vals {
+				switch j % 3 {
+				case 0:
+					vals[r] = "2024-01-01 12:34:56.123456"
+				case 1:
+					vals[r] = "12345.6789"
+				default:
+					vals[r] = strconv.Itoa(c*rows + r)
+				}
+			}
+			vals[7] = nil
+			for _, v := range vals {
+				estimate++
+				if s, ok := v.(string); ok {
+					estimate += len(s) + 4
+				}
+			}
+			dc.Columns[j] = vals
+		}
+		req.Chunks = append(req.Chunks, dc)
+	}
+	return Header{ConnectionID: "bench", HasQueryID: true, ClientQueryID: 1}, req, estimate
+}
+
+func BenchmarkEncodeSendData(b *testing.B) {
+	h, req, _ := benchSendData()
+	p, err := Encode(h, req)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.SetBytes(int64(len(p)))
+	b.ReportAllocs()
+	for range b.N {
+		if _, err := Encode(h, req); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkEncodeSendDataSized encodes with the Appender's size hint.
+func BenchmarkEncodeSendDataSized(b *testing.B) {
+	h, req, estimate := benchSendData()
+	hint := estimate + estimate/8 + 1024
+	p, err := EncodeSize(h, req, hint)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if cap(p) != hint {
+		b.Fatalf("payload %d bytes grew past the %d-byte hint", len(p), hint)
+	}
+	b.SetBytes(int64(len(p)))
+	b.ReportAllocs()
+	for range b.N {
+		if _, err := EncodeSize(h, req, hint); err != nil {
 			b.Fatal(err)
 		}
 	}

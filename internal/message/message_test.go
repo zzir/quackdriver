@@ -449,3 +449,38 @@ func TestDecodeStrictness(t *testing.T) {
 		}
 	}
 }
+
+// EncodeSize writes the bytes Encode writes whatever its hint: too small,
+// exact, generous or negative. The chunk has every encodable type, so the
+// string layout's two-pass path (VARCHAR, BLOB, JSON, CHAR) and its
+// rendered path (BIT, BIGNUM) are both covered, NULLs included.
+func TestEncodeSizeMatchesEncode(t *testing.T) {
+	h := Header{ConnectionID: "c", HasQueryID: true, ClientQueryID: 7}
+	chunk := roundTripChunk()
+	bodies := []Body{
+		SendDataRequest{StreamID: "s", Chunks: []DataChunk{chunk, chunk}, BatchIndex: Idx(1)},
+		FetchResponse{Results: []DataChunk{chunk}, BatchIndex: Idx(2)},
+		PrepareRequest{SQL: "SELECT 1", QueryUUID: codec.HugeInt{Lower: 1}},
+	}
+	for _, body := range bodies {
+		want, err := Encode(h, body)
+		if err != nil {
+			t.Fatalf("%T: %v", body, err)
+		}
+		for _, hint := range []int{-1, 0, 1, len(want) - 1, len(want), len(want) + 1, 2 * len(want)} {
+			got, err := EncodeSize(h, body, hint)
+			if err != nil {
+				t.Fatalf("%T hint %d: %v", body, hint, err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatalf("%T hint %d: %d bytes differ from Encode's %d", body, hint, len(got), len(want))
+			}
+			if hint >= len(want) && cap(got) != hint {
+				t.Fatalf("%T hint %d: cap %d, the buffer should not have grown", body, hint, cap(got))
+			}
+		}
+	}
+	if _, err := EncodeSize(h, nil, 10); err == nil {
+		t.Fatal("nil body: expected error")
+	}
+}

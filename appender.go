@@ -143,6 +143,7 @@ type Appender struct {
 type pendingChunk struct {
 	chunk message.DataChunk
 	first int64 // row number of the chunk's first row
+	bytes int   // the chunk's share of Appender.curBytes: its encoded size, roughly
 }
 
 // appendError gives an Appender failure its context while keeping the cause
@@ -374,6 +375,7 @@ func (a *Appender) sealChunk() {
 	a.pending = append(a.pending, pendingChunk{
 		chunk: message.DataChunk{RowCount: a.curRows, Types: a.chunkTypes, Columns: cols},
 		first: a.curFirst,
+		bytes: a.curBytes,
 	})
 	a.pendingBytes += a.curBytes
 	a.curRows, a.curBytes = 0, 0
@@ -402,15 +404,21 @@ func (a *Appender) sendChunks(chunks []pendingChunk) error {
 		return err
 	}
 	data := make([]message.DataChunk, len(chunks))
+	size := 0
 	for i, c := range chunks {
 		data[i] = c.chunk
+		size += c.bytes
 	}
 	index := a.batches + 1
-	payload, err := message.Encode(a.header(), message.SendDataRequest{
+	// The request is encoded into a buffer sized from the estimate, which
+	// counts a NULL as one byte where the wire spends four on its length
+	// entry: an eighth more covers NULL-heavy columns, so the buffer does
+	// not grow (and copy) once more at the end.
+	payload, err := message.EncodeSize(a.header(), message.SendDataRequest{
 		StreamID:   a.streamID,
 		Chunks:     data,
 		BatchIndex: message.Idx(index),
-	})
+	}, size+size/8+1024)
 	if err != nil {
 		return a.fail(&appendError{what: "encode " + rowRange(chunks), err: err}, true)
 	}
@@ -472,9 +480,11 @@ func splitChunk(c pendingChunk) (pendingChunk, pendingChunk) {
 	return pendingChunk{
 		chunk: message.DataChunk{RowCount: mid, Types: c.chunk.Types, Columns: left},
 		first: c.first,
+		bytes: c.bytes / 2,
 	}, pendingChunk{
 		chunk: message.DataChunk{RowCount: c.chunk.RowCount - mid, Types: c.chunk.Types, Columns: right},
 		first: c.first + int64(mid),
+		bytes: c.bytes - c.bytes/2,
 	}
 }
 

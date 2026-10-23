@@ -660,15 +660,72 @@ func encodeGeometryVector(w *codec.Writer, vals []any) error {
 }
 
 // encodeStringVector writes the 2.0 string layout: every row's length (0
-// for NULL) as u32, then the bytes of the non-NULL rows back to back.
+// for NULL) as u32, then the bytes of the non-NULL rows back to back. The
+// total length precedes the bytes on the wire, so the values are measured
+// in a first pass and written straight into w in a second one. BIT and
+// BIGNUM, whose values are transformed, are rendered into a buffer first.
 func encodeStringVector(w *codec.Writer, t logicaltype.Type, vals []any) error {
+	if t.ID == logicaltype.IDBit || t.ID == logicaltype.IDBignum {
+		return encodeTransformedStringVector(w, t, vals)
+	}
+	lengths := make([]byte, 0, len(vals)*4)
+	var total uint64
+	for i, v := range vals {
+		n, err := stringValueLen(t, v)
+		if err != nil {
+			return rowError(i, err)
+		}
+		if uint64(n) > math.MaxUint32 {
+			return rowError(i, fmt.Errorf("%s value of %d bytes exceeds the 4 GiB limit", t.Name(), n))
+		}
+		total += uint64(n)
+		lengths = binary.LittleEndian.AppendUint32(lengths, uint32(n))
+	}
+	w.WriteFieldID(107)
+	w.WriteULEB128(total) // optional_idx, always valid
+	w.WriteFieldID(108)
+	w.WriteBlob(lengths)
+	w.WriteFieldID(109)
+	w.WriteULEB128(total) // the blob's length prefix; its bytes follow
+	for _, v := range vals {
+		switch x := v.(type) {
+		case string:
+			w.WriteRawString(x)
+		case []byte:
+			w.WriteBytes(x)
+		}
+	}
+	return nil
+}
+
+// stringValueLen is the number of bytes a string-layout value that is sent
+// as is (a string or []byte; NULL is empty) takes on the wire.
+func stringValueLen(t logicaltype.Type, v any) (int, error) {
+	switch x := v.(type) {
+	case nil:
+		return 0, nil
+	case string:
+		return len(x), nil
+	case []byte:
+		return len(x), nil
+	}
+	if t.ID == logicaltype.IDBlob {
+		return 0, typeError(t, v, "[]byte or string")
+	}
+	return 0, typeError(t, v, "string or []byte")
+}
+
+// encodeTransformedStringVector is encodeStringVector for BIT and BIGNUM,
+// whose values are rendered into their storage form before their lengths
+// are known.
+func encodeTransformedStringVector(w *codec.Writer, t logicaltype.Type, vals []any) error {
 	lengths := make([]byte, 0, len(vals)*4)
 	var data []byte
 	for i, v := range vals {
 		start := len(data)
 		if v != nil {
 			var err error
-			if data, err = appendStringValue(data, t, v); err != nil {
+			if data, err = appendTransformedStringValue(data, t, v); err != nil {
 				return rowError(i, err)
 			}
 		}
@@ -687,7 +744,7 @@ func encodeStringVector(w *codec.Writer, t logicaltype.Type, vals []any) error {
 	return nil
 }
 
-func appendStringValue(buf []byte, t logicaltype.Type, v any) ([]byte, error) {
+func appendTransformedStringValue(buf []byte, t logicaltype.Type, v any) ([]byte, error) {
 	switch t.ID {
 	case logicaltype.IDBit:
 		s, ok := v.(string)
@@ -710,16 +767,7 @@ func appendStringValue(buf []byte, t logicaltype.Type, v any) ([]byte, error) {
 		}
 		return append(buf, b...), nil
 	}
-	switch x := v.(type) {
-	case string:
-		return append(buf, x...), nil
-	case []byte:
-		return append(buf, x...), nil
-	}
-	if t.ID == logicaltype.IDBlob {
-		return nil, typeError(t, v, "[]byte or string")
-	}
-	return nil, typeError(t, v, "string or []byte")
+	return nil, fmt.Errorf("%s is not a transformed string type", t.Name())
 }
 
 func encodeStructVector(w *codec.Writer, t logicaltype.Type, vals []any, depth int) error {

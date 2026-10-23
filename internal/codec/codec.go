@@ -327,11 +327,25 @@ type Writer struct {
 // NewWriter returns a fresh Writer.
 func NewWriter() *Writer { return &Writer{} }
 
+// NewWriterSize returns a Writer with room for n bytes before its buffer has
+// to grow. A caller that knows the encoded size, or an estimate of it, saves
+// the copies a growing buffer makes; n is only a capacity, the Writer grows
+// past it as needed.
+func NewWriterSize(n int) *Writer {
+	if n < 0 {
+		n = 0
+	}
+	return &Writer{buf: make([]byte, 0, n)}
+}
+
 // Bytes returns the accumulated buffer, which the Writer still owns.
 func (w *Writer) Bytes() []byte { return w.buf }
 
 // WriteBytes appends raw bytes without a length prefix.
 func (w *Writer) WriteBytes(b []byte) { w.buf = append(w.buf, b...) }
+
+// WriteRawString appends the bytes of s without a length prefix.
+func (w *Writer) WriteRawString(s string) { w.buf = append(w.buf, s...) }
 
 // WriteBool writes one boolean byte.
 func (w *Writer) WriteBool(v bool) {

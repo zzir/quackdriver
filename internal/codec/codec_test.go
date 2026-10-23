@@ -190,3 +190,40 @@ func TestReaderSince(t *testing.T) {
 		t.Fatalf("Since = %v (cap %d)", got, cap(got))
 	}
 }
+
+func TestNewWriterSize(t *testing.T) {
+	w := NewWriterSize(64)
+	if len(w.Bytes()) != 0 || cap(w.Bytes()) < 64 {
+		t.Fatalf("NewWriterSize(64): len %d cap %d", len(w.Bytes()), cap(w.Bytes()))
+	}
+	if w := NewWriterSize(-1); len(w.Bytes()) != 0 {
+		t.Fatalf("NewWriterSize(-1): len %d", len(w.Bytes()))
+	}
+	// The capacity is a hint: the output is that of a fresh Writer, and the
+	// buffer grows past it.
+	want := NewWriter()
+	for _, w := range []*Writer{NewWriterSize(0), NewWriterSize(3), want} {
+		w.WriteULEB128(300)
+		w.WriteRawString("raw")
+		w.WriteBytes([]byte{1, 2})
+		w.WriteString("s")
+		w.WriteBlob(bytes.Repeat([]byte{7}, 100))
+	}
+	for _, n := range []int{0, 3} {
+		w := NewWriterSize(n)
+		w.WriteULEB128(300)
+		w.WriteRawString("raw")
+		w.WriteBytes([]byte{1, 2})
+		w.WriteString("s")
+		w.WriteBlob(bytes.Repeat([]byte{7}, 100))
+		if !bytes.Equal(w.Bytes(), want.Bytes()) {
+			t.Fatalf("NewWriterSize(%d) wrote % x, want % x", n, w.Bytes(), want.Bytes())
+		}
+	}
+	// WriteRawString is WriteBytes for a string: no length prefix.
+	w = NewWriter()
+	w.WriteRawString("ab")
+	if !bytes.Equal(w.Bytes(), []byte("ab")) {
+		t.Fatalf("WriteRawString: % x", w.Bytes())
+	}
+}
