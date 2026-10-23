@@ -27,7 +27,7 @@ func TestHandshakeV3Request(t *testing.T) {
 	if req.ClientDuckdbVersion != "v2.0.0" {
 		t.Fatalf("client_duckdb_version %q", req.ClientDuckdbVersion)
 	}
-	if !strings.HasPrefix(req.ClientPlatform, "quackdriver/0.2.0-dev go") {
+	if !strings.HasPrefix(req.ClientPlatform, "quackdriver/"+Version+" go") {
 		t.Fatalf("client_platform %q", req.ClientPlatform)
 	}
 	if req.ClientID != "my-client" || req.HeartbeatTimeoutSeconds != 7 || req.AuthString != testToken {

@@ -6,6 +6,8 @@ The format follows [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-23
+
 Rewrite for Quack protocol **v3** (DuckDB 2.0). This is a breaking upgrade: DuckDB 1.x servers (Quack v1) are no longer supported, and the handshake reports that DuckDB 2.0 or newer is required.
 
 ### Changed — breaking
@@ -128,5 +130,6 @@ Each fix has a unit-level regression test; the data race is exercised by `go tes
 - **Typed `Scan` for nested types** is not yet implemented — `LIST`/`STRUCT`/`MAP`/`ARRAY` come back as `[]any` / `map[string]any`.
 - **`GEOMETRY`, `ENUM`, `BIT`** are decoded as `[]byte` / integers and are not exercised by the test suite. Read at your own risk.
 
-[Unreleased]: https://github.com/zzir/quackdriver/compare/v0.1.0-alpha.1...HEAD
+[Unreleased]: https://github.com/zzir/quackdriver/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/zzir/quackdriver/compare/v0.1.0-alpha.1...v0.2.0
 [0.1.0-alpha.1]: https://github.com/zzir/quackdriver/releases/tag/v0.1.0-alpha.1

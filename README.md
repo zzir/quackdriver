@@ -2,7 +2,7 @@
 
 Pure-Go [`database/sql`](https://pkg.go.dev/database/sql) driver for [DuckDB](https://duckdb.org/)'s **Quack** remote protocol.
 
-> **Status: alpha (v0.2.0-dev).** The driver speaks Quack protocol **v3**, the protocol of **DuckDB 2.0**. It does not talk to DuckDB 1.x servers (Quack v1): the handshake fails with a message saying that DuckDB 2.0 or newer is required. DuckDB does not consider the Quack protocol stable yet, so pin DuckDB releases in production.
+> **Status: alpha (v0.2.0).** The driver speaks Quack protocol **v3**, the protocol of **DuckDB 2.0**. It does not talk to DuckDB 1.x servers (Quack v1): the handshake fails with a message saying that DuckDB 2.0 or newer is required. DuckDB does not consider the Quack protocol stable yet, so pin DuckDB releases in production.
 
 ## Highlights
 
@@ -10,7 +10,7 @@ Pure-Go [`database/sql`](https://pkg.go.dev/database/sql) driver for [DuckDB](ht
 - **Zero third-party dependencies** in the core driver: only the Go standard library.
 - **`database/sql` compatible.** `sql.Open("quack", dsn)`, connection pooling, client-side prepared statements, transactions, `context` cancellation (sent to the server as `CANCEL`), typed column metadata.
 - **Streaming results.** Large results arrive in FETCH batches that the driver reads ahead in the background (`fetch_ahead`), with heartbeats keeping the session alive between batches.
-- **Bulk insert.** `Conn.Append` and the streaming `Appender` stream rows (`SEND_DATA`) into one atomic `INSERT` that casts them with DuckDB's own rules: millions of rows per second against a local server, versus thousands for single-row `INSERT` statements.
+- **Bulk insert.** `Conn.Append` and the streaming `Appender` stream rows (`SEND_DATA`) into one atomic `INSERT` that casts them with DuckDB's own rules: millions of narrow rows per second against a local server, versus thousands for single-row `INSERT` statements (see [Bulk insert](#bulk-insert-connappend-and-appender)).
 - **TLS with certificate pinning** (`ssl_fingerprint`), custom TLS configuration and extra HTTP headers for reverse proxies.
 - **Golden-fixture-locked wire format.** 79 request/response exchanges captured from the official DuckDB v2.0.0 release CLI (quack extension `f96420e`; see [`testdata/golden/README.md`](./testdata/golden/README.md)) guard against protocol drift; unit tests run without a server.
 
@@ -19,6 +19,8 @@ Pure-Go [`database/sql`](https://pkg.go.dev/database/sql) driver for [DuckDB](ht
 ```bash
 go get github.com/zzir/quackdriver
 ```
+
+Without a version, `go get` takes the newest tag, `v0.2.0` or later. Do not pin `v0.1.0-alpha.1`: that is the Quack **v1** driver for DuckDB 1.x, and against a DuckDB 2.0 server it fails at the handshake with `codec: expected end-of-object marker at offset 87`, not with a message about versions.
 
 Requirements:
 
@@ -109,6 +111,8 @@ Conn.Append                200000 rows     46ms      4310159 rows/s
 Appender                   200000 rows     62ms      3243454 rows/s
 ```
 
+Those are narrow rows that fit in memory; the cost per row grows with the number of columns. `Conn.Append` and the `Appender` share one send path, so `Conn.Append` is never faster per row: it differs in needing every row in memory as `[][]any` before it starts, which for millions of wide rows is gigabytes of boxed values. Use `Conn.Append` for batches that fit comfortably in memory and the `Appender` for large or unbounded loads, which it streams about 32 MiB at a time.
+
 `Conn.Append` streams rows already in memory:
 
 ```go
@@ -157,7 +161,7 @@ err := conn.Raw(func(d any) error {
 })
 ```
 
-While an `Appender` is open it holds its connection: other statements on it fail with `ErrConnBusy`. A connection returned to the pool with an `Appender` still open (neither `Close` nor `Abort` was called) is discarded, which aborts its `INSERT`. `WithUnordered()` lets the server insert in parallel without keeping the row order. Cancel the context given to `NewAppender` to abort a blocked call.
+While an `Appender` is open it holds its connection: other statements on it fail with `ErrConnBusy`. That is the driver's `*quackdriver.Conn`: inside the `conn.Raw` callback, `database/sql` holds the connection's lock, so a statement run through the same `*sql.Conn` there (`conn.ExecContext`, say) does not get `ErrConnBusy` but blocks forever. Run other statements on another connection, or after the callback returns. A connection returned to the pool with an `Appender` still open (neither `Close` nor `Abort` was called) is discarded, which aborts its `INSERT`. `WithUnordered()` lets the server insert in parallel without keeping the row order. Cancel the context given to `NewAppender` to abort a blocked call.
 
 `AppendColumn.Type` is any DuckDB type expression (`INTEGER`, `DECIMAL(18, 4)`, `INTEGER[3]`, `STRUCT(a INTEGER, "b c" VARCHAR)`, `MAP(VARCHAR, INTEGER)`, an alias such as `TEXT`, or a user-defined type). The server resolves the types in a statement of its own when the `Appender` starts; the values each type accepts are in the [write table](#write-direction-go--duckdb-via-connappend-and-appender) below.
 

@@ -81,8 +81,12 @@ func WithUnordered() AppenderOption {
 // number of rows the server inserted.
 //
 // The Appender holds its connection exclusively until Close or Abort:
-// meanwhile other statements on the connection fail with ErrConnBusy. With
-// database/sql, create and finish it inside sql.Conn.Raw:
+// meanwhile other statements on the connection fail with ErrConnBusy. That
+// is the driver's Conn: inside sql.Conn.Raw, database/sql holds the
+// connection's lock, so a statement run through the same sql.Conn there
+// blocks instead of failing. With database/sql, create and finish the
+// Appender inside sql.Conn.Raw and run other statements on another
+// connection:
 //
 //	err := sc.Raw(func(dc any) error {
 //		a, err := dc.(*quackdriver.Conn).NewAppender(ctx, "", "events", cols)
