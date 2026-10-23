@@ -161,14 +161,14 @@ func TestDroppedSessionRetried(t *testing.T) {
 
 func TestLeaseExpiry(t *testing.T) {
 	s := newServer(t)
-	s.SetLeaseUnit(20 * time.Millisecond)
 	fastHeartbeat(t, time.Hour) // no heartbeats: let the lease lapse
 	s.Script("SELECT 1", intResult(1, 1))
-	db := openDB(t, s, "heartbeat_timeout=1s")
+	db := openDB(t, s)
 	if err := db.Ping(); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(60 * time.Millisecond)
+	s.ExpireLeases() // the Ping renewed the session during this lease,
+	s.ExpireLeases() // nothing did during this one
 	if _, err := db.Exec("SELECT 1"); err != nil {
 		t.Fatalf("Exec after expiry: %v", err)
 	}

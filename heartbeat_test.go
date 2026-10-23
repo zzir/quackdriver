@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -39,36 +40,59 @@ func TestHeartbeatTimings(t *testing.T) {
 	}
 }
 
-// TestHeartbeatKeepsBusyConnAlive runs a statement whose PREPARE takes
-// several leases: the concurrent heartbeat keeps the session alive so the
-// FETCH afterwards succeeds; without heartbeats the lease lapses.
+// TestHeartbeatKeepsBusyConnAlive runs a statement whose PREPARE spans
+// several heartbeat leases: the concurrent heartbeats keep the session alive
+// so the FETCH afterwards succeeds; without heartbeats the lease lapses.
+// The server's leases pass with ExpireLeases, each once a heartbeat arrived,
+// not on the clock: a short real lease also expired whenever -race on a busy
+// machine descheduled the test for longer than the lease.
 func TestHeartbeatKeepsBusyConnAlive(t *testing.T) {
+	const leases = 5
 	for _, c := range []struct {
 		interval time.Duration
 		alive    bool
-	}{{8 * time.Millisecond, true}, {time.Hour, false}} {
+	}{{5 * time.Millisecond, true}, {time.Hour, false}} {
 		s := newServer(t)
-		s.SetLeaseUnit(40 * time.Millisecond) // heartbeat_timeout=1s lasts 40ms
 		fastHeartbeat(t, c.interval)
 		gate := make(chan struct{})
-		time.AfterFunc(250*time.Millisecond, func() { close(gate) })
 		res := intResult(6, 3)
 		res.PrepareGate = gate
 		s.Script("SELECT slow", res)
-		db := openDB(t, s, "heartbeat_timeout=1s", "inline_rows=0")
-		rows, err := db.Query("SELECT slow")
-		if err != nil {
-			t.Fatal(err)
+		db := openDB(t, s, "inline_rows=0")
+		// Registered last, so it runs first: a failing case must not leave
+		// the PREPARE (and with it the server's and the DB's Close) hanging.
+		openGate := sync.OnceFunc(func() { close(gate) })
+		t.Cleanup(openGate)
+		type query struct {
+			rows *sql.Rows
+			err  error
 		}
-		got := scanInts(t, rows)
-		if err := rows.Err(); (err == nil) != c.alive {
+		done := make(chan query, 1)
+		go func() {
+			rows, err := db.Query("SELECT slow")
+			done <- query{rows, err}
+		}()
+		eventually(t, "the PREPARE", func() bool { return s.Count(message.TypePrepareRequest) > 0 })
+		for range leases {
+			if c.alive {
+				n := s.Count(message.TypeHeartbeatRequest)
+				eventually(t, "a heartbeat during the PREPARE", func() bool {
+					return s.Count(message.TypeHeartbeatRequest) > n
+				})
+			}
+			s.ExpireLeases()
+		}
+		openGate()
+		q := <-done
+		if q.err != nil {
+			t.Fatal(q.err)
+		}
+		got := scanInts(t, q.rows)
+		if err := q.rows.Err(); (err == nil) != c.alive {
 			t.Fatalf("interval %v: %v", c.interval, err)
 		}
 		if c.alive {
 			checkSequence(t, got, 6)
-			if n := s.Count(message.TypeHeartbeatRequest); n < 5 {
-				t.Fatalf("only %d heartbeats during a 250ms statement", n)
-			}
 		}
 	}
 }

@@ -206,7 +206,11 @@ type connState struct {
 	id        string
 	lease     time.Duration
 	lastRenew time.Time
-	stmt      *stmtState
+	// renewed: a request (or the handshake) renewed the session since the
+	// last ExpireLeases; expired: an ExpireLeases found it idle.
+	renewed bool
+	expired bool
+	stmt    *stmtState
 	// abort: the uuid and error of the last aborted statement
 	abortedUUID codec.HugeInt
 	abortErr    string
@@ -285,11 +289,30 @@ func (s *Server) ScriptFunc(f func(sql string) (Result, bool)) {
 }
 
 // SetLeaseUnit sets the real duration of one heartbeat-timeout "second"
-// (default time.Second), so lease expiry can be tested quickly.
+// (default time.Second), so lease expiry can be tested quickly. A short
+// lease also expires whenever the test process is descheduled for longer
+// than it (-race on a loaded or CPU-throttled CI machine), so a test that
+// needs a session to survive should keep the default and pass leases with
+// ExpireLeases instead.
 func (s *Server) SetLeaseUnit(d time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.leaseUnit = d
+}
+
+// ExpireLeases makes one whole heartbeat lease pass now, independent of the
+// clock: every session without a request since the previous call (or since
+// its handshake) has expired, which its next request finds out like a lease
+// that ran out in time.
+func (s *Server) ExpireLeases() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range s.conns {
+		if !c.renewed {
+			c.expired = true
+		}
+		c.renewed = false
+	}
 }
 
 // SetQuackVersion sets the quack_version the CONNECTION_RESPONSE reports.
@@ -609,6 +632,7 @@ func (s *Server) connect(b message.ConnectionRequest) (string, message.Body) {
 		id:        id,
 		lease:     time.Duration(b.HeartbeatTimeoutSeconds) * s.leaseUnit,
 		lastRenew: time.Now(),
+		renewed:   true,
 		streams:   make(map[string]*streamState),
 	}
 	return id, message.ConnectionResponse{
@@ -627,12 +651,13 @@ func (s *Server) session(id string) (*connState, *message.ErrorResponse) {
 		return nil, errResp("Invalid connection id")
 	}
 	now := time.Now()
-	if now.Sub(c.lastRenew) >= c.lease {
+	if c.expired || now.Sub(c.lastRenew) >= c.lease {
 		delete(s.conns, id)
 		s.abortLocked(c, "connection heartbeat lease expired")
 		return nil, errResp("Connection heartbeat lease expired")
 	}
 	c.lastRenew = now
+	c.renewed = true
 	return c, nil
 }
 

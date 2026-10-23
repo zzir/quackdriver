@@ -122,14 +122,21 @@ func TestHandshake(t *testing.T) {
 
 func TestSessionLifecycle(t *testing.T) {
 	s := newServer(t)
-	s.SetLeaseUnit(time.Millisecond)
-	c := connect(t, s) // lease 60 units = 60ms
+	c := connect(t, s)
+	s.ExpireLeases() // the handshake renewed the session during this lease
 	if _, ok := c.do(message.HeartbeatRequest{}).(message.SuccessResponse); !ok {
 		t.Fatal("heartbeat")
 	}
-	time.Sleep(70 * time.Millisecond)
+	s.ExpireLeases() // the heartbeat renewed it during this one
+	s.ExpireLeases() // nothing did during this one
 	c.wantError(message.HeartbeatRequest{}, "Connection heartbeat lease expired")
 	c.wantError(message.HeartbeatRequest{}, "Invalid connection id")
+
+	// The same on the clock; the sleep only bounds the lease from below.
+	s.SetLeaseUnit(time.Millisecond)
+	c = connect(t, s) // lease 60 units = 60ms
+	time.Sleep(70 * time.Millisecond)
+	c.wantError(message.HeartbeatRequest{}, "Connection heartbeat lease expired")
 
 	s.SetLeaseUnit(time.Second)
 	c = connect(t, s)
