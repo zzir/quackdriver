@@ -22,7 +22,7 @@ go get github.com/zzir/quackdriver
 
 Requirements:
 
-- Go 1.22+
+- Go 1.26+. The minimum follows Go's own support policy: it is the older of the two Go releases maintained upstream, and it moves up when a new Go release ships.
 - For the server side: the DuckDB CLI **v2.0.0 or newer** with the Quack extension (`INSTALL quack; LOAD quack;`)
 
 ## Quick start
@@ -369,7 +369,7 @@ make test-integration DUCKDB_BIN=/path/to/duckdb QUACK_TEST_INIT_SQL="SET force_
 
 `make bench` and `make dump-wire` use a server already answering on `QUACK_HOST:QUACK_PORT` (default `127.0.0.1:9494`) as is; otherwise `scripts/with-server.sh` starts one and stops it afterwards.
 
-`.tool-versions` pins the Go and golangci-lint that lint the code, locally and in CI; `make lint` refuses other versions (`mise install` or `asdf install` installs these). The tests themselves run on the oldest supported Go and on the latest one. Dependabot keeps the GitHub Actions and the bun example's dependencies current; the weekly `canary` workflow lints with the newest Go and golangci-lint and turns red when a Go release calls for bumping `.tool-versions` or the minimum Go version.
+`.tool-versions` pins the Go and golangci-lint that lint the code, locally and in CI; `make lint` refuses other versions (`mise install` or `asdf install` installs these). The tests themselves run on the minimum Go (`go.mod`'s go line) and on the latest one. Dependabot keeps the GitHub Actions and the bun example's dependencies current; the weekly `canary` workflow lints with the newest Go and golangci-lint and turns red when a Go release calls for bumping `.tool-versions` or the minimum Go version.
 
 ### Project layout
 

@@ -10,6 +10,7 @@ Rewrite for Quack protocol **v3** (DuckDB 2.0). This is a breaking upgrade: Duck
 
 ### Changed — breaking
 
+- Go 1.26 or newer is required (was 1.22): the oldest Go release still maintained upstream. The minimum now follows Go's support policy and moves up when a new Go release ships. The driver's own tests therefore run with the runtime defaults users get, such as post-quantum TLS key exchange, instead of Go 1.22 compatibility settings.
 - Wire protocol v3: `PREPARE` with inline rows, numbered `FETCH` batches with acknowledgements and read-ahead (`fetch_ahead`, default 1), heartbeats keeping the session lease, `CANCEL` on context cancellation, `DISCONNECT` on close. HTTP/1.1 with the `application/vnd.duckdb` media type.
 - `APPEND_REQUEST` is gone; `Conn.Append` now streams rows with `SEND_DATA` into one `INSERT ... SELECT ... FROM scan_data_from_quack_client(...)` statement.
 - `Conn.Append` and the `Appender` send every value as text (VARCHAR chunks) that the server casts to the column's `Type`, so DuckDB's own cast rules apply. `AppendColumn.Type` is resolved by the server (one extra statement when an `Appender` starts): any DuckDB type expression works, user-defined types included, and only what DuckDB accepts (the driver's `LIST(T)` spelling is gone; use `T[]`). Ranges and formats are checked by the server: an out-of-range integer, a malformed value, an unknown ENUM label or a duplicate MAP key now fails the statement with a `*Error` instead of a `*ValueError`, and a DECIMAL string with more fractional digits than the scale is rounded instead of rejected. `Conn.Append` starts the INSERT before converting the rows and aborts it at the first row it cannot convert; nothing is inserted either way. UNION columns can no longer be appended (DuckDB's cast from text picks the member itself).
@@ -41,7 +42,7 @@ Rewrite for Quack protocol **v3** (DuckDB 2.0). This is a breaking upgrade: Duck
 ### Removed
 
 - Local mode (`quack:local[/path]`, which started a DuckDB CLI for the driver) and `CloseLocalServers`: run a server with `quack_serve` and connect to it. A `quack:local` DSN is rejected with an error saying so.
-- The examples are consolidated into `basic`, `types`, `append`, `tls-pin`, `bench-append` and `bun`.
+- The examples are consolidated into `basic`, `types`, `append`, `tls-pin`, `bench-append` and `bun` (now on bun v1.3.0).
 - Development tooling is trimmed: `make test` is the unit tests, `make test-integration` the whole suite (which builds and runs the examples), `make lint` what CI lints; `make server`, `make bench` and `make dump-wire` stay. Gone are `make test-unit`/`test-go-integration`/`test-examples`/`test-bun`/`server-bg`/`stop`/`clean`/`help`, `scripts/dump-wire.sh` (`cmd/dump-wire` now reads `QUACK_HOST`/`QUACK_PORT`/`QUACK_TOKEN` or `QUACK_DSN` like the examples) and `scripts/run-examples.sh`. `scripts/start-quack-server.sh` drops `QUACK_EXTENSION_REPO` and `QUACK_LOG`; its `QUACK_TEST_INIT_SQL` replaces the default `INSTALL quack; LOAD quack;`, as in the integration tests. `.tool-versions` pins the Go and golangci-lint used by `make lint` and CI's lint job (`make lint` refuses others); Dependabot updates the GitHub Actions and the bun example's dependencies, and a weekly `canary` workflow flags when a new Go or golangci-lint release calls for a bump.
 
 ## [0.1.0-alpha.1] — 2026-05-25

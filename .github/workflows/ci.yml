@@ -15,12 +15,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ['1.22', 'stable']
+        include:
+          # The minimum is go.mod's go line (latest patch release); it is
+          # written nowhere else.
+          - go: minimum
+            go-version-file: go.mod
+          - go: stable
+            go-version: stable
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version: ${{ matrix.go }}
+          go-version: ${{ matrix.go-version }}
+          go-version-file: ${{ matrix.go-version-file }}
       - run: go vet ./...
       - run: go test -race -count=1 ./...
 
