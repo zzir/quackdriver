@@ -3,77 +3,108 @@ package quackdriver
 import (
 	"context"
 	"database/sql/driver"
-	"runtime"
+	"errors"
+	"fmt"
+	"io"
+	"sync"
+	"sync/atomic"
 
-	"github.com/zzir/quackdriver/internal/localserver"
-	"github.com/zzir/quackdriver/internal/message"
+	"github.com/zzir/quackdriver/internal/sqlfmt"
 	"github.com/zzir/quackdriver/internal/transport"
 )
 
-// clientVersion is sent in the ConnectionRequest. Bump when a server expects
-// a newer string for compatibility checks.
-const clientVersion = "v1.5.3"
-
-// Connector is a parsed DSN that can produce new Conn values.
+// Connector is a parsed DSN plus the HTTP transport shared by every
+// connection it opens. Use it with sql.OpenDB:
+//
+//	c, err := quackdriver.NewConnector("quack://db.example:9494?token=...")
+//	if err != nil { ... }
+//	db := sql.OpenDB(c) // db.Close also closes the connector
+//
+// A Connector is safe for concurrent use.
 type Connector struct {
-	uri         *transport.URI
-	localServer *localserver.Server
+	uri       *transport.URI
+	transport *transport.Transport
+
+	closed    atomic.Bool
+	closeOnce sync.Once
 }
 
-func newConnector(dsn string) (*Connector, error) {
+var (
+	_ driver.Connector = (*Connector)(nil)
+	_ io.Closer        = (*Connector)(nil)
+)
+
+// NewConnector parses dsn and prepares a Connector.
+func NewConnector(dsn string, opts ...Option) (*Connector, error) {
 	u, err := transport.ParseURI(dsn)
 	if err != nil {
 		return nil, err
 	}
-	c := &Connector{uri: u}
-	if u.IsLocal {
-		srv, err := localserver.Acquire(u.DBPath, u.Token, u.Timeout)
-		if err != nil {
-			return nil, err
+	var o connectorOptions
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&o)
 		}
-		u.Host = "127.0.0.1"
-		u.Port = srv.Port()
-		u.Token = srv.Token()
-		c.localServer = srv
 	}
-	return c, nil
+	t, err := transport.New(u, o.transport)
+	if err != nil {
+		return nil, fmt.Errorf("quackdriver: %w", err)
+	}
+	return &Connector{uri: t.URI, transport: t}, nil
 }
 
-// Close releases resources held by this Connector. For local-mode
-// Connectors, this decrements the local server's reference count and
-// may stop the DuckDB process.
+// Close releases the idle HTTP connections of the Connector. Connections
+// opened earlier should be closed first. Close is idempotent; database/sql
+// calls it from DB.Close.
 func (c *Connector) Close() error {
-	if c.localServer != nil {
-		return c.localServer.Release()
-	}
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		if c.transport != nil {
+			c.transport.CloseIdleConnections()
+		}
+	})
 	return nil
 }
 
-// Connect opens a Quack session by issuing a ConnectionRequest.
+// Connect opens a Quack session (CONNECTION_REQUEST) and starts its
+// heartbeat.
 func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
-	return c.connect(ctx)
-}
-
-// Driver returns the underlying Driver value.
-func (c *Connector) Driver() driver.Driver { return Driver{} }
-
-func (c *Connector) connect(ctx context.Context) (*Conn, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	t := transport.New(c.uri)
-	conn := &Conn{
-		transport: t,
-		token:     c.uri.Token,
-	}
-	if err := conn.handshake(ctx); err != nil {
+	conn, err := c.connect(ctx)
+	if err != nil {
 		return nil, err
 	}
 	return conn, nil
 }
 
-func defaultPlatform() string {
-	return "go-" + runtime.GOOS + "-" + runtime.GOARCH
-}
+// Driver returns the underlying Driver value.
+func (c *Connector) Driver() driver.Driver { return Driver{} }
 
-var _ message.Body = message.ConnectionRequest{}
+var errConnectorClosed = errors.New("quackdriver: connector is closed")
+
+func (c *Connector) connect(ctx context.Context) (*Conn, error) {
+	if c.closed.Load() {
+		return nil, errConnectorClosed
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	conn := newConn(c)
+	if err := conn.handshake(ctx); err != nil {
+		return nil, err
+	}
+	if tz := c.uri.TimeZone; tz != "" {
+		// time.Time arguments are sent as TIMESTAMP literals of their UTC
+		// wall clock, which DuckDB converts to TIMESTAMPTZ in the session's
+		// TimeZone: timezone=UTC makes that conversion exact.
+		lit, err := sqlfmt.FormatValue(tz)
+		if err == nil {
+			_, err = conn.ExecContext(ctx, "SET SESSION TimeZone = "+lit, nil)
+		}
+		if err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("quackdriver: timezone=%s: %w", tz, err)
+		}
+	}
+	conn.startHeartbeat()
+	return conn, nil
+}

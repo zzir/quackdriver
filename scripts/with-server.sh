@@ -1,50 +1,41 @@
 #!/usr/bin/env bash
-# Run a command with a running Quack server.
+# Run a command against a Quack server on QUACK_HOST:QUACK_PORT (default
+# 127.0.0.1:9494). A server already answering there is used as is; otherwise
+# start-quack-server.sh is started in the background (output in SERVER_LOG,
+# default /tmp/quack-server.log) and stopped when the command ends.
 #
-# Behavior:
-#   - If a server is already listening on QUACK_PORT (default 9494), use it.
-#   - Otherwise start one in the background using start-quack-server.sh,
-#     remember that *we* started it, and tear it down on exit.
-#   - Always restores the original state (won't kill someone else's server).
+#   scripts/with-server.sh go run ./cmd/probe-fetch -rows 1000000
 #
-# Usage:
-#   scripts/with-server.sh <command> [args...]
-#
-# Env vars (all optional):
-#   QUACK_HOST, QUACK_PORT, QUACK_TOKEN — forwarded to start-quack-server.sh
-#   QUACK_EXTENSION_REPO                — extension repo override (default empty)
-#   SERVER_LOG                          — log file (default /tmp/quack-server.log)
+# QUACK_START_TIMEOUT (default 60) is the seconds to wait for a started
+# server; the first start may download the extension.
 set -euo pipefail
 
 host="${QUACK_HOST:-127.0.0.1}"
 port="${QUACK_PORT:-9494}"
-log_file="${SERVER_LOG:-/tmp/quack-server.log}"
+log="${SERVER_LOG:-/tmp/quack-server.log}"
+timeout="${QUACK_START_TIMEOUT:-60}"
 
-owned=0
+# A Quack server answers GET / with 200.
+up() { curl -fsS -o /dev/null --max-time 2 --noproxy '*' "http://${host}:${port}/" 2>/dev/null; }
 
-cleanup() {
-  local rc=$?
-  if [ "$owned" = 1 ]; then
-    echo "==> stopping quack server" >&2
-    lsof -ti ":$port" 2>/dev/null | xargs kill 2>/dev/null || true
-  fi
-  exit "$rc"
-}
-trap cleanup EXIT INT TERM
-
-if ! lsof -ti ":$port" >/dev/null 2>&1; then
-  echo "==> starting quack server (log: $log_file)" >&2
-  QUACK_HOST="$host" QUACK_PORT="$port" \
-    QUACK_EXTENSION_REPO="${QUACK_EXTENSION_REPO-}" \
-    bash "$(dirname "$0")/start-quack-server.sh" >"$log_file" 2>&1 &
-  owned=1
-  for _ in $(seq 1 40); do
-    if lsof -ti ":$port" >/dev/null 2>&1; then break; fi
+if ! up; then
+  echo "==> starting a Quack server on ${host}:${port} (log: ${log})" >&2
+  bash "$(dirname "$0")/start-quack-server.sh" >"${log}" 2>&1 &
+  pid=$!
+  # Stop the server when the command ends, keeping the command's exit status.
+  trap 'rc=$?; kill "${pid}" 2>/dev/null; wait "${pid}" 2>/dev/null || true; exit "${rc}"' EXIT
+  for _ in $(seq 1 $((timeout * 4))); do
+    up && break
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      echo "the Quack server exited during startup; tail of ${log}:" >&2
+      tail -20 "${log}" >&2
+      exit 1
+    fi
     sleep 0.25
   done
-  if ! lsof -ti ":$port" >/dev/null 2>&1; then
-    echo "server failed to start within 10s; tail of $log_file:" >&2
-    tail -20 "$log_file" >&2 || true
+  if ! up; then
+    echo "the Quack server did not answer within ${timeout}s; tail of ${log}:" >&2
+    tail -20 "${log}" >&2
     exit 1
   fi
 fi

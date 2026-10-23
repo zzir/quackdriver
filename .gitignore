@@ -8,3 +8,6 @@
 /bin/
 CLAUDE.md
 AGENTS.md
+
+duckdb
+duckdb*.gz

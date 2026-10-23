@@ -1,14 +1,26 @@
-// dump-wire connects to a running Quack server and captures the request and
-// response bytes of a canonical set of round-trips into testdata/golden/.
+// dump-wire connects to a running Quack server (DuckDB 2.0, Quack protocol
+// v3) and captures the request and response bytes of a canonical set of
+// round trips into testdata/golden/.
 //
 // The captured bytes are immutable fixtures used by the unit tests under
-// internal/message — they lock in wire-format compatibility against a known
-// server version.
+// internal/message (golden_test.go): they lock in wire-format compatibility
+// against a known server build. Every client request is deterministic (fixed
+// query UUIDs, stream id, client id and platform strings, sequential
+// client_query_id); only the connection_id the server assigns varies between
+// captures. See testdata/golden/README.md for the fixture catalog and their
+// provenance.
 //
 // Usage:
 //
-//	DUCKDB version v1.5.3 server running on quack:127.0.0.1:9494
-//	go run ./cmd/dump-wire [-out testdata/golden] [-dsn quack://127.0.0.1:9494?token=super_secret]
+//	make dump-wire                            (starts a UTC server when none runs)
+//	go run ./cmd/dump-wire [-out testdata/golden] [-dsn quack://127.0.0.1:9494?token=super_secret] [-v]
+//
+// Without -dsn the server address comes from QUACK_HOST, QUACK_PORT and
+// QUACK_TOKEN (default 127.0.0.1:9494, token super_secret), or from a full
+// QUACK_DSN, like the examples. The tool creates and drops tables named
+// golden_* on the server. The server must run in UTC (start it with TZ=UTC):
+// the fixtures hold its TIMESTAMPTZ renderings, and a capture from a server
+// in another time zone fails, leaving the fixtures untouched.
 package main
 
 import (
@@ -16,153 +28,100 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
-	"runtime"
+	"time"
 
-	"github.com/zzir/quackdriver/internal/message"
 	"github.com/zzir/quackdriver/internal/transport"
 )
 
 func main() {
-	dsn := flag.String("dsn", "quack://127.0.0.1:9494?token=super_secret", "Quack DSN")
+	dsn := flag.String("dsn", envDSN(), "Quack DSN of a DuckDB 2.0 server")
 	outDir := flag.String("out", "testdata/golden", "directory for captured fixtures")
+	verbose := flag.Bool("v", false, "print a summary of every captured exchange")
+	timeout := flag.Duration("timeout", 2*time.Minute, "overall capture timeout")
 	flag.Parse()
+	if err := capture(*dsn, *outDir, *verbose, *timeout); err != nil {
+		log.Fatalf("dump-wire: %v", err)
+	}
+}
 
-	uri, err := transport.ParseURI(*dsn)
+// envDSN returns QUACK_DSN when set, else a DSN built from QUACK_HOST,
+// QUACK_PORT and QUACK_TOKEN (default 127.0.0.1:9494, token super_secret).
+func envDSN() string {
+	if d := os.Getenv("QUACK_DSN"); d != "" {
+		return d
+	}
+	return "quack://" + net.JoinHostPort(env("QUACK_HOST", "127.0.0.1"), env("QUACK_PORT", "9494")) +
+		"?token=" + url.QueryEscape(env("QUACK_TOKEN", "super_secret"))
+}
+
+func env(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func capture(dsn, outDir string, verbose bool, timeout time.Duration) error {
+	uri, err := transport.ParseURI(dsn)
 	if err != nil {
-		log.Fatalf("parse dsn: %v", err)
+		return fmt.Errorf("parse dsn: %w", err)
 	}
-	if err := os.MkdirAll(*outDir, 0o755); err != nil {
-		log.Fatalf("mkdir: %v", err)
-	}
-
-	c := &capturer{outDir: *outDir, tr: transport.New(uri), token: uri.Token}
-	c.tr.Trace = c.onTrace
-	if err := c.run(context.Background()); err != nil {
-		log.Fatalf("capture: %v", err)
-	}
-	fmt.Printf("wrote %d fixture file(s) to %s\n", c.count, *outDir)
-}
-
-type capturer struct {
-	tr       *transport.Transport
-	token    string
-	outDir   string
-	connID   string
-	queryID  uint64
-	curName  string
-	count    int
-}
-
-func (c *capturer) onTrace(sent, received []byte) {
-	if c.curName == "" {
-		return
-	}
-	c.write(c.curName+".req.bin", sent)
-	c.write(c.curName+".resp.bin", received)
-}
-
-func (c *capturer) write(name string, data []byte) {
-	path := filepath.Join(c.outDir, name)
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		log.Fatalf("write %s: %v", path, err)
-	}
-	c.count++
-}
-
-func (c *capturer) roundTrip(ctx context.Context, name string, body message.Body) (message.Header, message.Body) {
-	c.curName = name
-	defer func() { c.curName = "" }()
-
-	c.queryID++
-	hdr := message.Header{
-		ConnectionID:  c.connID,
-		HasQueryID:    true,
-		ClientQueryID: c.queryID,
-	}
-	req, err := message.Encode(hdr, body)
+	tr, err := transport.New(uri, transport.Options{})
 	if err != nil {
-		log.Fatalf("encode %s: %v", name, err)
+		return err
 	}
-	respBytes, err := c.tr.Request(ctx, req)
+	defer tr.CloseIdleConnections()
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return err
+	}
+	// Capture into a scratch directory next to the output and replace the
+	// old fixture set only once the whole capture succeeded, so that a
+	// failed run neither leaves a half-updated set nor stale files.
+	tmp, err := os.MkdirTemp(filepath.Dir(filepath.Clean(outDir)), ".dump-wire-")
 	if err != nil {
-		log.Fatalf("transport %s: %v", name, err)
+		return err
 	}
-	h, b, err := message.Decode(respBytes)
-	if err != nil {
-		log.Fatalf("decode %s: %v", name, err)
+	defer func() { _ = os.RemoveAll(tmp) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	c := &capturer{tr: tr, token: uri.Token, outDir: tmp, verbose: verbose, written: map[string]bool{}}
+	if err := c.run(ctx); err != nil {
+		return fmt.Errorf("capture: %w", err)
 	}
-	return h, b
+	if err := replaceFixtures(tmp, outDir); err != nil {
+		return fmt.Errorf("install fixtures: %w", err)
+	}
+	fmt.Printf("wrote %d fixture file(s) to %s (server %s)\n", c.count, outDir, c.serverVersion)
+	return nil
 }
 
-func (c *capturer) run(ctx context.Context) error {
-	// 1. handshake
-	h, body := c.roundTrip(ctx, "handshake", message.ConnectionRequest{
-		AuthString:               c.token,
-		ClientDuckdbVersion:      "v1.5.3",
-		ClientPlatform:           "go-" + runtime.GOOS + "-" + runtime.GOARCH,
-		MinSupportedQuackVersion: 1,
-		MaxSupportedQuackVersion: 1,
-	})
-	if _, ok := body.(message.ConnectionResponse); !ok {
-		return fmt.Errorf("handshake: expected ConnectionResponse, got %T (%+v)", body, body)
-	}
-	c.connID = h.ConnectionID
-	fmt.Printf("connected; connection_id=%q\n", c.connID)
-
-	// 2. canonical SELECT queries — one per primitive family
-	cases := []struct {
-		name string
-		sql  string
-	}{
-		{"select_int", "SELECT 42::INTEGER AS i"},
-		{"select_bigint", "SELECT 9000000000::BIGINT AS b"},
-		{"select_double", "SELECT 3.14159::DOUBLE AS d"},
-		{"select_bool", "SELECT TRUE AS t, FALSE AS f"},
-		{"select_varchar", "SELECT 'hello, 🦆' AS s"},
-		{"select_null", "SELECT NULL::INTEGER AS n"},
-		{"select_hugeint", "SELECT 170141183460469231731687303715884105727::HUGEINT AS h"},
-		{"select_uuid", "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::UUID AS u"},
-		{"select_date", "SELECT DATE '2026-05-25' AS d"},
-		{"select_timestamp", "SELECT TIMESTAMP '2026-05-25 12:34:56.789' AS ts"},
-		{"select_decimal", "SELECT 12345.67::DECIMAL(9,2) AS amt"},
-		{"select_list", "SELECT [1, 2, 3]::INTEGER[] AS xs"},
-		{"select_struct", "SELECT {'a': 1::INTEGER, 'b': 'x'} AS s"},
-		{"select_multirow", "SELECT i FROM range(0, 5) AS t(i)"},
-	}
-	for _, c2 := range cases {
-		_, body := c.roundTrip(ctx, c2.name, message.PrepareRequest{SQL: c2.sql})
-		if _, ok := body.(message.PrepareResponse); !ok {
-			return fmt.Errorf("%s: expected PrepareResponse, got %T", c2.name, body)
+// replaceFixtures removes every *.req.bin / *.resp.bin in dst and moves the
+// freshly captured ones from src there. Other files (README.md) are kept.
+func replaceFixtures(src, dst string) error {
+	for _, pattern := range []string{"*.req.bin", "*.resp.bin"} {
+		old, err := filepath.Glob(filepath.Join(dst, pattern))
+		if err != nil {
+			return err
+		}
+		for _, f := range old {
+			if err := os.Remove(f); err != nil {
+				return err
+			}
 		}
 	}
-
-	// 3. multi-chunk: needs_more_fetch=true followed by FETCH
-	_, body = c.roundTrip(ctx, "select_multichunk", message.PrepareRequest{SQL: "SELECT i FROM range(0, 200000) AS t(i)"})
-	prep, ok := body.(message.PrepareResponse)
-	if !ok {
-		return fmt.Errorf("multichunk: expected PrepareResponse, got %T", body)
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
 	}
-	if prep.NeedsMoreFetch {
-		_, body := c.roundTrip(ctx, "fetch_more", message.FetchRequest{ResultUUID: prep.ResultUUID})
-		if _, ok := body.(message.FetchResponse); !ok {
-			return fmt.Errorf("fetch: expected FetchResponse, got %T", body)
+	for _, e := range entries {
+		if err := os.Rename(filepath.Join(src, e.Name()), filepath.Join(dst, e.Name())); err != nil {
+			return err
 		}
-	} else {
-		fmt.Println("note: 200000-row query did not need a FETCH; chunk size may be larger than expected")
-	}
-
-	// 4. error path — bad SQL
-	_, body = c.roundTrip(ctx, "error_bad_sql", message.PrepareRequest{SQL: "SELECT * FROM does_not_exist"})
-	if _, ok := body.(message.ErrorResponse); !ok {
-		return fmt.Errorf("error: expected ErrorResponse, got %T", body)
-	}
-
-	// 5. disconnect
-	_, body = c.roundTrip(ctx, "disconnect", message.DisconnectMessage{})
-	if _, ok := body.(message.SuccessResponse); !ok {
-		return fmt.Errorf("disconnect: expected SuccessResponse, got %T", body)
 	}
 	return nil
 }

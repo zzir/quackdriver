@@ -1,0 +1,72 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: unit (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The minimum is go.mod's go line (latest patch release); it is
+          # written nowhere else.
+          - go: minimum
+            go-version-file: go.mod
+          - go: stable
+            go-version: stable
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ matrix.go-version }}
+          go-version-file: ${{ matrix.go-version-file }}
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Go and golangci-lint come from .tool-versions, which `make lint`
+      # checks as well. They move together: golangci-lint cannot type-check
+      # a standard library newer than the Go it was built with.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: .tool-versions
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version-file: .tool-versions
+
+  integration:
+    # End-to-end run against a real DuckDB 2.0 server with the quack extension.
+    runs-on: ubuntu-latest
+    env:
+      DUCKDB_VERSION: v2.0.0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - name: Install DuckDB CLI
+        # DuckDB 2.0 publishes the CLI as duckdb-cli-<platform>.tar.gz (1.x
+        # used duckdb_cli-<platform>.zip), holding a single duckdb binary.
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/duckdb.tgz" \
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb-cli-linux-amd64.tar.gz"
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf "$RUNNER_TEMP/duckdb.tgz" -C "$HOME/.local/bin" duckdb
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Check the DuckDB version
+        run: duckdb -no-agent --version | tee /dev/stderr | grep -q '^v2\.'
+      # The tests start their own DuckDB CLIs; integration/examples builds
+      # and runs every example program.
+      - name: Integration tests against live servers
+        run: go test -count=1 -tags integration ./...

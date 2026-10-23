@@ -1,7 +1,8 @@
-// Package codec implements DuckDB BinarySerializer primitive read/write
-// for the Quack wire protocol. Field IDs are little-endian uint16; the
-// sentinel FieldEnd (0xFFFF) terminates an object. Optional/default-valued
-// fields may be omitted on the wire — readers detect this via PeekFieldID.
+// Package codec implements the DuckDB BinarySerializer primitives the Quack
+// wire protocol is built from, at StorageVersion::V2_0_0 (both peers pin
+// it). An object is a sequence of (u16 LE field id, value) pairs closed by
+// FieldEnd (0xFFFF); properties written "with default" are omitted when they
+// hold their default value.
 package codec
 
 import (
@@ -10,15 +11,23 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sort"
 )
 
 // FieldEnd marks the end of a BinarySerializer object.
 const FieldEnd uint16 = 0xFFFF
 
-// SerializationCompatibilityIndex is the SerializationCompatibility::FromIndex
-// value the Quack server expects. Pinned for now; bump when the protocol
-// negotiates a new compatibility version.
-const SerializationCompatibilityIndex = 7
+// InvalidIndex is DuckDB's DConstants::INVALID_INDEX (2^64-1). An unset
+// optional_idx is serialized as this value.
+const InvalidIndex uint64 = math.MaxUint64
+
+// OptionalIdx mirrors DuckDB's optional_idx: an idx_t that may be unset.
+// On the wire a set value is its ULEB128 encoding and an unset value is the
+// InvalidIndex sentinel; a set value equal to InvalidIndex cannot be encoded.
+type OptionalIdx struct {
+	Value uint64
+	Valid bool
+}
 
 // HugeInt mirrors DuckDB's hugeint_t: a 128-bit value stored as a signed
 // upper word + unsigned lower word. Wire order: SLEB upper, ULEB lower.
@@ -26,6 +35,11 @@ type HugeInt struct {
 	Lower uint64
 	Upper int64
 }
+
+// MaxPrealloc caps preallocations sized by a count from the wire: a count is
+// only checked against the remaining bytes, while an element may take far
+// more memory than its one byte. A false count then fails on the read.
+const MaxPrealloc = 1024
 
 // Reader decodes BinarySerializer primitives from a byte slice.
 type Reader struct {
@@ -39,11 +53,12 @@ func NewReader(buf []byte) *Reader { return &Reader{buf: buf} }
 // Pos returns the current byte offset.
 func (r *Reader) Pos() int { return r.pos }
 
+// Since returns the bytes consumed since offset start (an earlier Pos). The
+// slice aliases the input.
+func (r *Reader) Since(start int) []byte { return r.buf[start:r.pos:r.pos] }
+
 // Remaining returns the number of unread bytes.
 func (r *Reader) Remaining() int { return len(r.buf) - r.pos }
-
-// EOF reports whether all bytes have been consumed.
-func (r *Reader) EOF() bool { return r.pos >= len(r.buf) }
 
 // AssertEOF returns an error if any bytes remain.
 func (r *Reader) AssertEOF() error {
@@ -54,7 +69,8 @@ func (r *Reader) AssertEOF() error {
 }
 
 func (r *Reader) need(n int) error {
-	if r.pos+n > len(r.buf) {
+	// Compare against the remaining length so a huge n cannot overflow pos+n.
+	if n < 0 || n > len(r.buf)-r.pos {
 		return fmt.Errorf("codec: unexpected EOF at offset %d (need %d, have %d): %w", r.pos, n, len(r.buf)-r.pos, io.ErrUnexpectedEOF)
 	}
 	return nil
@@ -71,11 +87,8 @@ func (r *Reader) ReadByte() (byte, error) {
 }
 
 // ReadBytes reads n raw bytes without a length prefix. The returned slice
-// shares the underlying array — callers must copy before mutation.
+// aliases the input.
 func (r *Reader) ReadBytes(n int) ([]byte, error) {
-	if n < 0 {
-		return nil, fmt.Errorf("codec: negative read length %d", n)
-	}
 	if err := r.need(n); err != nil {
 		return nil, err
 	}
@@ -141,11 +154,11 @@ func (r *Reader) ReadSLEB128() (int64, error) {
 
 // ReadString reads a ULEB-length-prefixed UTF-8 string.
 func (r *Reader) ReadString() (string, error) {
-	n, err := r.ReadULEB128()
+	n, err := r.ReadCount()
 	if err != nil {
 		return "", err
 	}
-	b, err := r.ReadBytes(int(n))
+	b, err := r.ReadBytes(n)
 	if err != nil {
 		return "", err
 	}
@@ -154,16 +167,76 @@ func (r *Reader) ReadString() (string, error) {
 
 // ReadBlob reads a ULEB-length-prefixed binary blob. The result is a copy.
 func (r *Reader) ReadBlob() ([]byte, error) {
-	n, err := r.ReadULEB128()
+	n, err := r.ReadCount()
 	if err != nil {
 		return nil, err
 	}
-	b, err := r.ReadBytes(int(n))
+	b, err := r.ReadBytes(n)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]byte, len(b))
 	copy(out, b)
+	return out, nil
+}
+
+// ReadCount reads a ULEB byte length or element count. Every byte, and every
+// element of a BinarySerializer list, takes at least one byte of input, so a
+// count larger than the remaining input is rejected before the caller
+// allocates for it.
+func (r *Reader) ReadCount() (int, error) {
+	start := r.pos
+	n, err := r.ReadULEB128()
+	if err != nil {
+		return 0, err
+	}
+	if n > uint64(r.Remaining()) {
+		return 0, fmt.Errorf("codec: count %d at offset %d exceeds the %d remaining byte(s): %w", n, start, r.Remaining(), io.ErrUnexpectedEOF)
+	}
+	return int(n), nil
+}
+
+// ReadOptionalIdx reads a DuckDB optional_idx (ULEB128, InvalidIndex = unset).
+func (r *Reader) ReadOptionalIdx() (OptionalIdx, error) {
+	v, err := r.ReadULEB128()
+	if err != nil {
+		return OptionalIdx{}, err
+	}
+	if v == InvalidIndex {
+		return OptionalIdx{}, nil
+	}
+	return OptionalIdx{Value: v, Valid: true}, nil
+}
+
+// ReadStringMap reads an unordered_map<string, string>: a ULEB entry count,
+// then one object {0: key, 1: value} per entry. A repeated key keeps the
+// last value, like DuckDB's deserializer.
+func (r *Reader) ReadStringMap() (map[string]string, error) {
+	n, err := r.ReadCount()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, min(n, MaxPrealloc))
+	for range n {
+		var key, value string
+		if err := r.ReadObject(func(r *Reader) error {
+			if err := r.ReadRequiredField(0, func(r *Reader) error {
+				v, err := r.ReadString()
+				key = v
+				return err
+			}); err != nil {
+				return err
+			}
+			return r.ReadRequiredField(1, func(r *Reader) error {
+				v, err := r.ReadString()
+				value = v
+				return err
+			})
+		}); err != nil {
+			return nil, err
+		}
+		out[key] = value
+	}
 	return out, nil
 }
 
@@ -180,95 +253,13 @@ func (r *Reader) ReadHugeInt() (HugeInt, error) {
 	return HugeInt{Lower: lower, Upper: upper}, nil
 }
 
-// ReadFixedInt8 reads one signed byte.
-func (r *Reader) ReadFixedInt8() (int8, error) {
-	b, err := r.ReadByte()
-	return int8(b), err
-}
-
-// ReadFixedUint8 reads one unsigned byte.
-func (r *Reader) ReadFixedUint8() (uint8, error) { return r.ReadByte() }
-
-// ReadFixedInt16 reads a signed 16-bit little-endian integer.
-func (r *Reader) ReadFixedInt16() (int16, error) {
-	if err := r.need(2); err != nil {
-		return 0, err
+// readFieldID reads the next field id.
+func (r *Reader) readFieldID() (uint16, error) {
+	id, err := r.PeekFieldID()
+	if err == nil {
+		r.pos += 2
 	}
-	v := int16(binary.LittleEndian.Uint16(r.buf[r.pos:]))
-	r.pos += 2
-	return v, nil
-}
-
-// ReadFixedUint16 reads an unsigned 16-bit little-endian integer.
-func (r *Reader) ReadFixedUint16() (uint16, error) {
-	if err := r.need(2); err != nil {
-		return 0, err
-	}
-	v := binary.LittleEndian.Uint16(r.buf[r.pos:])
-	r.pos += 2
-	return v, nil
-}
-
-// ReadFixedInt32 reads a signed 32-bit little-endian integer.
-func (r *Reader) ReadFixedInt32() (int32, error) {
-	if err := r.need(4); err != nil {
-		return 0, err
-	}
-	v := int32(binary.LittleEndian.Uint32(r.buf[r.pos:]))
-	r.pos += 4
-	return v, nil
-}
-
-// ReadFixedUint32 reads an unsigned 32-bit little-endian integer.
-func (r *Reader) ReadFixedUint32() (uint32, error) {
-	if err := r.need(4); err != nil {
-		return 0, err
-	}
-	v := binary.LittleEndian.Uint32(r.buf[r.pos:])
-	r.pos += 4
-	return v, nil
-}
-
-// ReadFixedInt64 reads a signed 64-bit little-endian integer.
-func (r *Reader) ReadFixedInt64() (int64, error) {
-	if err := r.need(8); err != nil {
-		return 0, err
-	}
-	v := int64(binary.LittleEndian.Uint64(r.buf[r.pos:]))
-	r.pos += 8
-	return v, nil
-}
-
-// ReadFixedUint64 reads an unsigned 64-bit little-endian integer.
-func (r *Reader) ReadFixedUint64() (uint64, error) {
-	if err := r.need(8); err != nil {
-		return 0, err
-	}
-	v := binary.LittleEndian.Uint64(r.buf[r.pos:])
-	r.pos += 8
-	return v, nil
-}
-
-// ReadFixedFloat32 reads an IEEE-754 32-bit little-endian float.
-func (r *Reader) ReadFixedFloat32() (float32, error) {
-	bits, err := r.ReadFixedUint32()
-	return math.Float32frombits(bits), err
-}
-
-// ReadFixedFloat64 reads an IEEE-754 64-bit little-endian float.
-func (r *Reader) ReadFixedFloat64() (float64, error) {
-	bits, err := r.ReadFixedUint64()
-	return math.Float64frombits(bits), err
-}
-
-// ReadFieldID reads the next 16-bit little-endian field id.
-func (r *Reader) ReadFieldID() (uint16, error) {
-	if err := r.need(2); err != nil {
-		return 0, err
-	}
-	v := binary.LittleEndian.Uint16(r.buf[r.pos:])
-	r.pos += 2
-	return v, nil
+	return id, err
 }
 
 // PeekFieldID returns the next field id without advancing the reader.
@@ -281,7 +272,7 @@ func (r *Reader) PeekFieldID() (uint16, error) {
 
 // ReadEndObject consumes and validates the FieldEnd marker.
 func (r *Reader) ReadEndObject() error {
-	id, err := r.ReadFieldID()
+	id, err := r.readFieldID()
 	if err != nil {
 		return err
 	}
@@ -301,7 +292,7 @@ func (r *Reader) ReadObject(fn func(*Reader) error) error {
 
 // ReadRequiredField asserts the next field has fieldID, then invokes fn.
 func (r *Reader) ReadRequiredField(fieldID uint16, fn func(*Reader) error) error {
-	actual, err := r.ReadFieldID()
+	actual, err := r.readFieldID()
 	if err != nil {
 		return err
 	}
@@ -311,9 +302,8 @@ func (r *Reader) ReadRequiredField(fieldID uint16, fn func(*Reader) error) error
 	return fn(r)
 }
 
-// ReadOptionalField invokes fn iff the next field id equals fieldID, otherwise
-// returns false (caller falls back to a default). Returns (true, err) when
-// fn ran, or (false, nil) when the field was absent.
+// ReadOptionalField runs fn when the next field is fieldID and reports
+// whether it was present; an absent field leaves the caller's default.
 func (r *Reader) ReadOptionalField(fieldID uint16, fn func(*Reader) error) (bool, error) {
 	id, err := r.PeekFieldID()
 	if err != nil {
@@ -322,9 +312,7 @@ func (r *Reader) ReadOptionalField(fieldID uint16, fn func(*Reader) error) (bool
 	if id != fieldID {
 		return false, nil
 	}
-	if _, err := r.ReadFieldID(); err != nil {
-		return false, err
-	}
+	r.pos += 2
 	if err := fn(r); err != nil {
 		return false, err
 	}
@@ -339,17 +327,8 @@ type Writer struct {
 // NewWriter returns a fresh Writer.
 func NewWriter() *Writer { return &Writer{} }
 
-// Bytes returns the accumulated buffer. The slice is owned by the Writer and
-// must not be mutated after subsequent writes.
+// Bytes returns the accumulated buffer, which the Writer still owns.
 func (w *Writer) Bytes() []byte { return w.buf }
-
-// Len returns the number of bytes written so far.
-func (w *Writer) Len() int { return len(w.buf) }
-
-// WriteByte appends one byte. The error return is always nil; it exists to
-// satisfy io.ByteWriter so callers can pass *Writer where that interface is
-// expected.
-func (w *Writer) WriteByte(b byte) error { w.buf = append(w.buf, b); return nil }
 
 // WriteBytes appends raw bytes without a length prefix.
 func (w *Writer) WriteBytes(b []byte) { w.buf = append(w.buf, b...) }
@@ -398,56 +377,44 @@ func (w *Writer) WriteBlob(b []byte) {
 	w.buf = append(w.buf, b...)
 }
 
+// WriteOptionalIdx writes a DuckDB optional_idx. An unset value is written as
+// the InvalidIndex sentinel; a set value equal to InvalidIndex is an error
+// (DuckDB's serializer throws for it too).
+func (w *Writer) WriteOptionalIdx(v OptionalIdx) error {
+	if !v.Valid {
+		w.WriteULEB128(InvalidIndex)
+		return nil
+	}
+	if v.Value == InvalidIndex {
+		return errors.New("codec: cannot serialize an optional_idx set to INVALID_INDEX")
+	}
+	w.WriteULEB128(v.Value)
+	return nil
+}
+
+// WriteStringMap writes an unordered_map<string, string> as a ULEB entry
+// count followed by one object {0: key, 1: value} per entry. DuckDB writes
+// the entries in hash order; any order decodes to the same map, so keys are
+// sorted here to keep the encoding deterministic.
+func (w *Writer) WriteStringMap(m map[string]string) {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	w.WriteULEB128(uint64(len(keys)))
+	for _, k := range keys {
+		w.WriteObject(func(w *Writer) {
+			w.WriteField(0, func(w *Writer) { w.WriteString(k) })
+			w.WriteField(1, func(w *Writer) { w.WriteString(m[k]) })
+		})
+	}
+}
+
 // WriteHugeInt writes a hugeint as [SLEB upper][ULEB lower].
 func (w *Writer) WriteHugeInt(h HugeInt) {
 	w.WriteSLEB128(h.Upper)
 	w.WriteULEB128(h.Lower)
-}
-
-// WriteFixedInt8 writes a signed byte.
-func (w *Writer) WriteFixedInt8(v int8) { w.buf = append(w.buf, byte(v)) }
-
-// WriteFixedUint8 writes an unsigned byte.
-func (w *Writer) WriteFixedUint8(v uint8) { w.buf = append(w.buf, v) }
-
-// WriteFixedInt16 writes a signed 16-bit little-endian integer.
-func (w *Writer) WriteFixedInt16(v int16) {
-	w.buf = binary.LittleEndian.AppendUint16(w.buf, uint16(v))
-}
-
-// WriteFixedUint16 writes an unsigned 16-bit little-endian integer.
-func (w *Writer) WriteFixedUint16(v uint16) {
-	w.buf = binary.LittleEndian.AppendUint16(w.buf, v)
-}
-
-// WriteFixedInt32 writes a signed 32-bit little-endian integer.
-func (w *Writer) WriteFixedInt32(v int32) {
-	w.buf = binary.LittleEndian.AppendUint32(w.buf, uint32(v))
-}
-
-// WriteFixedUint32 writes an unsigned 32-bit little-endian integer.
-func (w *Writer) WriteFixedUint32(v uint32) {
-	w.buf = binary.LittleEndian.AppendUint32(w.buf, v)
-}
-
-// WriteFixedInt64 writes a signed 64-bit little-endian integer.
-func (w *Writer) WriteFixedInt64(v int64) {
-	w.buf = binary.LittleEndian.AppendUint64(w.buf, uint64(v))
-}
-
-// WriteFixedUint64 writes an unsigned 64-bit little-endian integer.
-func (w *Writer) WriteFixedUint64(v uint64) {
-	w.buf = binary.LittleEndian.AppendUint64(w.buf, v)
-}
-
-// WriteFixedFloat32 writes an IEEE-754 32-bit little-endian float.
-func (w *Writer) WriteFixedFloat32(v float32) {
-	w.WriteFixedUint32(math.Float32bits(v))
-}
-
-// WriteFixedFloat64 writes an IEEE-754 64-bit little-endian float.
-func (w *Writer) WriteFixedFloat64(v float64) {
-	w.WriteFixedUint64(math.Float64bits(v))
 }
 
 // WriteFieldID writes a 16-bit little-endian field id.
@@ -468,4 +435,38 @@ func (w *Writer) WriteObject(fn func(*Writer)) {
 func (w *Writer) WriteField(id uint16, fn func(*Writer)) {
 	w.WriteFieldID(id)
 	fn(w)
+}
+
+// ReadStringWithDefault reads property id into *dst when it is present (a
+// property DuckDB writes "with default").
+func (r *Reader) ReadStringWithDefault(id uint16, dst *string) error {
+	_, err := r.ReadOptionalField(id, func(r *Reader) (err error) {
+		*dst, err = r.ReadString()
+		return err
+	})
+	return err
+}
+
+// ReadUintWithDefault reads ULEB property id into *dst when it is present.
+func (r *Reader) ReadUintWithDefault(id uint16, dst *uint64) error {
+	_, err := r.ReadOptionalField(id, func(r *Reader) (err error) {
+		*dst, err = r.ReadULEB128()
+		return err
+	})
+	return err
+}
+
+// WriteStringWithDefault writes property id unless s is empty, like DuckDB's
+// WritePropertyWithDefault.
+func (w *Writer) WriteStringWithDefault(id uint16, s string) {
+	if s != "" {
+		w.WriteField(id, func(w *Writer) { w.WriteString(s) })
+	}
+}
+
+// WriteUintWithDefault writes ULEB property id unless v is 0.
+func (w *Writer) WriteUintWithDefault(id uint16, v uint64) {
+	if v != 0 {
+		w.WriteField(id, func(w *Writer) { w.WriteULEB128(v) })
+	}
 }

@@ -1,96 +1,56 @@
-# quackdriver — local development tasks.
+# quackdriver — development tasks.
 #
-# `make test` is the headline target: build + vet + go test + every example
-# against an auto-managed Quack server. `make help` lists the rest.
+# test-integration, dump-wire and bench need the DuckDB CLI v2.0.0+ (Quack
+# protocol v3) with the quack extension; DUCKDB_BIN names it when it is not
+# `duckdb` on PATH (an absolute path: the tests run in their package
+# directories). Every test server runs QUACK_TEST_INIT_SQL (default
+# "INSTALL quack; LOAD quack;") before quack_serve; a CLI without httpfs needs
+#
+#   make test-integration DUCKDB_BIN=$PWD/duckdb \
+#     QUACK_TEST_INIT_SQL="SET force_mbedtls_unsafe = 'true'; INSTALL quack; LOAD quack;"
+#
+# dump-wire and bench use the server on QUACK_HOST:QUACK_PORT (default
+# 127.0.0.1:9494, token QUACK_TOKEN = super_secret) when one answers there;
+# otherwise scripts/with-server.sh starts one and stops it afterwards.
 
-QUACK_HOST  ?= 127.0.0.1
-QUACK_PORT  ?= 9494
-QUACK_TOKEN ?= super_secret
-SERVER_LOG  ?= /tmp/quack-server.log
+.PHONY: test test-integration lint server dump-wire bench
 
-# Examples runnable as `go run ./examples/<name>` (no separate go.mod).
-EXAMPLES := basic types nested timeutc append append-rich append-struct append-enum multichunk
+# Unit tests against the fake server in internal/quacktest: no DuckDB needed.
+test:
+	go test -count=1 ./...
 
-export QUACK_HOST QUACK_PORT QUACK_TOKEN SERVER_LOG
+# The unit tests plus the integration suite: each package starts its own
+# DuckDB CLIs (internal/livetest); integration/examples builds and runs every
+# example program.
+test-integration:
+	go test -count=1 -tags integration ./...
 
-.PHONY: help all test test-unit test-examples test-bun build vet fmt \
-        server server-bg stop dump-wire bench bun-example clean
-
-help:
-	@echo "Targets:"
-	@echo "  test          build + vet + unit tests + examples (auto-manages server)"
-	@echo "  test-unit     just \`go test ./...\` (no server)"
-	@echo "  test-examples just the example programs (auto-manages server)"
-	@echo "  test-bun      run the bun ORM example (auto-manages server)"
-	@echo ""
-	@echo "  build         go build ./..."
-	@echo "  vet           go vet ./..."
-	@echo "  fmt           gofmt -w over all .go files"
-	@echo ""
-	@echo "  server        start the Quack server in the foreground"
-	@echo "  server-bg     start the Quack server in the background"
-	@echo "  stop          kill whatever is listening on QUACK_PORT"
-	@echo "  dump-wire     regenerate testdata/golden/*.bin (auto-manages server)"
-	@echo "  bench         APPEND vs INSERT benchmark (auto-manages server)"
-	@echo ""
-	@echo "  clean         remove the server log and stop any local server"
-	@echo ""
-	@echo "Vars (override via env or 'make VAR=value test'):"
-	@echo "  QUACK_HOST   = $(QUACK_HOST)"
-	@echo "  QUACK_PORT   = $(QUACK_PORT)"
-	@echo "  QUACK_TOKEN  = $(QUACK_TOKEN)"
-	@echo "  SERVER_LOG   = $(SERVER_LOG)"
-
-all: test
-
-test: build vet test-unit test-examples
-
-test-unit:
-	@echo "==> go test ./..."
-	go test ./... -count=1
-
-test-examples:
-	bash scripts/with-server.sh bash scripts/run-examples.sh $(EXAMPLES)
-
-test-bun:
-	bash scripts/with-server.sh bash -c 'cd examples/bun && go run .'
-
-build:
-	@echo "==> go build ./..."
-	go build ./...
-
-vet:
-	@echo "==> go vet ./..."
+# What CI runs besides the tests, with the Go and golangci-lint versions CI
+# uses (.tool-versions), so that a pass here is a pass there. `mise install`
+# installs them; otherwise bump .tool-versions in a pull request.
+lint:
+	@go_want=$$(awk '$$1 == "golang" {print $$2}' .tool-versions); \
+	lint_want=$$(awk '$$1 == "golangci-lint" {print $$2}' .tool-versions); \
+	go_have=$$(go env GOVERSION); go_have=$${go_have#go}; \
+	lint_have=$$(golangci-lint version --short 2>/dev/null || echo none); \
+	if [ "$${go_have%.*}" != "$${go_want%.*}" ] || [ "$$lint_have" != "$$lint_want" ]; then \
+		echo "make lint: .tool-versions (used by CI) says Go $$go_want and golangci-lint $$lint_want;"; \
+		echo "found Go $$go_have and golangci-lint $$lint_have."; \
+		exit 1; \
+	fi
 	go vet ./...
+	golangci-lint run ./...
 
-fmt:
-	@find . -name '*.go' -not -path './references/*' -print0 | xargs -0 gofmt -w
-
+# A Quack server in the foreground; Ctrl-C stops it.
 server:
-	@QUACK_EXTENSION_REPO= bash scripts/start-quack-server.sh
+	bash scripts/start-quack-server.sh
 
-server-bg:
-	@if lsof -ti :$(QUACK_PORT) >/dev/null 2>&1; then \
-		echo "port $(QUACK_PORT) already in use; assuming server is up"; \
-	else \
-		QUACK_EXTENSION_REPO= bash scripts/start-quack-server.sh >$(SERVER_LOG) 2>&1 & \
-		for _ in $$(seq 1 40); do lsof -ti :$(QUACK_PORT) >/dev/null 2>&1 && break; sleep 0.25; done; \
-		echo "==> server up on quack://$(QUACK_HOST):$(QUACK_PORT) (log: $(SERVER_LOG))"; \
-	fi
-
-stop:
-	@if lsof -ti :$(QUACK_PORT) >/dev/null 2>&1; then \
-		echo "==> killing process(es) on port $(QUACK_PORT)"; \
-		lsof -ti :$(QUACK_PORT) | xargs kill 2>/dev/null || true; \
-	else \
-		echo "nothing listening on port $(QUACK_PORT)"; \
-	fi
-
+# Re-capture testdata/golden/*.bin (see testdata/golden/README.md). The
+# fixtures hold TIMESTAMPTZ values rendered in the server's time zone, so the
+# server runs in UTC; dump-wire refuses one that does not.
 dump-wire:
-	bash scripts/with-server.sh go run ./cmd/dump-wire
+	TZ=UTC bash scripts/with-server.sh go run ./cmd/dump-wire
 
+# Per-row INSERT vs multi-row INSERT vs Conn.Append vs Appender.
 bench:
 	bash scripts/with-server.sh go run ./examples/bench-append
-
-clean: stop
-	@rm -f $(SERVER_LOG)

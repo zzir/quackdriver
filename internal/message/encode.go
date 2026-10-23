@@ -7,75 +7,104 @@ import (
 	"github.com/zzir/quackdriver/internal/logicaltype"
 )
 
-// Encode serializes a message header and body to a single byte buffer.
+// Encode serializes a message: the header object, the body object and, for
+// FETCH_RESPONSE and SEND_DATA_REQUEST, the raw DataChunk objects that follow
+// the body. h.Type is taken from body.
+//
+// Properties follow duckdb-quack's generated serialize_quack_message.cpp:
+// WriteProperty ones are always present, WritePropertyWithDefault ones are
+// omitted when they hold their default, so a request encodes to the bytes
+// the official client sends.
 func Encode(h Header, body Body) ([]byte, error) {
 	if body == nil {
 		return nil, fmt.Errorf("message: nil body")
 	}
 	h.Type = body.MessageType()
 	w := codec.NewWriter()
-	encodeHeader(w, h)
-	body.encode(w)
+	if err := encodeHeader(w, h); err != nil {
+		return nil, err
+	}
+	if err := body.encode(w); err != nil {
+		return nil, err
+	}
 	return w.Bytes(), nil
 }
 
-func encodeHeader(w *codec.Writer, h Header) {
+func encodeHeader(w *codec.Writer, h Header) error {
+	var err error
 	w.WriteObject(func(w *codec.Writer) {
 		w.WriteField(1, func(w *codec.Writer) { w.WriteULEB128(uint64(h.Type)) })
-		if h.ConnectionID != "" {
-			w.WriteField(2, func(w *codec.Writer) { w.WriteString(h.ConnectionID) })
-		}
+		w.WriteStringWithDefault(2, h.ConnectionID)
 		w.WriteField(3, func(w *codec.Writer) {
-			if h.HasQueryID {
-				w.WriteULEB128(h.ClientQueryID)
-			} else {
-				w.WriteULEB128(optionalIndexInvalid)
-			}
+			err = w.WriteOptionalIdx(OptionalIdx{Value: h.ClientQueryID, Valid: h.HasQueryID})
 		})
 	})
-}
-
-func writeOptionalString(w *codec.Writer, id uint16, s string) {
-	if s == "" {
-		return
+	if err != nil {
+		return fmt.Errorf("message: header client_query_id: %w", err)
 	}
-	w.WriteField(id, func(w *codec.Writer) { w.WriteString(s) })
+	return nil
 }
 
-func writeOptionalULEBNonZero(w *codec.Writer, id uint16, v uint64) {
-	if v == 0 {
-		return
+// writeBool writes a bool property "with default" false.
+func writeBool(w *codec.Writer, id uint16, v bool) {
+	if v {
+		w.WriteField(id, func(w *codec.Writer) { w.WriteBool(true) })
 	}
-	w.WriteField(id, func(w *codec.Writer) { w.WriteULEB128(v) })
 }
 
-func (m ConnectionRequest) encode(w *codec.Writer) {
+// writeIdx writes an optional_idx property "with default" (omitted when
+// unset).
+func writeIdx(w *codec.Writer, id uint16, name string, v OptionalIdx) error {
+	if !v.Valid {
+		return nil
+	}
+	var err error
+	w.WriteField(id, func(w *codec.Writer) { err = w.WriteOptionalIdx(v) })
+	if err != nil {
+		return fmt.Errorf("message: %s: %w", name, err)
+	}
+	return nil
+}
+
+func writeHugeInt(w *codec.Writer, id uint16, v codec.HugeInt) {
+	w.WriteField(id, func(w *codec.Writer) { w.WriteHugeInt(v) })
+}
+
+func (m ConnectionRequest) encode(w *codec.Writer) error {
 	w.WriteObject(func(w *codec.Writer) {
-		writeOptionalString(w, 1, m.AuthString)
-		writeOptionalString(w, 2, m.ClientDuckdbVersion)
-		writeOptionalString(w, 3, m.ClientPlatform)
-		writeOptionalULEBNonZero(w, 4, m.MinSupportedQuackVersion)
-		writeOptionalULEBNonZero(w, 5, m.MaxSupportedQuackVersion)
+		w.WriteStringWithDefault(1, m.AuthString)
+		w.WriteStringWithDefault(2, m.ClientDuckdbVersion)
+		w.WriteStringWithDefault(3, m.ClientPlatform)
+		w.WriteUintWithDefault(4, m.MinSupportedQuackVersion)
+		w.WriteUintWithDefault(5, m.MaxSupportedQuackVersion)
+		w.WriteStringWithDefault(6, m.ClientID)
+		w.WriteUintWithDefault(7, m.HeartbeatTimeoutSeconds)
 	})
+	return nil
 }
 
-func (m ConnectionResponse) encode(w *codec.Writer) {
+func (m ConnectionResponse) encode(w *codec.Writer) error {
 	w.WriteObject(func(w *codec.Writer) {
-		writeOptionalString(w, 1, m.ServerDuckdbVersion)
-		writeOptionalString(w, 2, m.ServerPlatform)
-		if m.HasQuackVersion {
-			w.WriteField(3, func(w *codec.Writer) { w.WriteULEB128(m.QuackVersion) })
-		}
+		w.WriteStringWithDefault(1, m.ServerDuckdbVersion)
+		w.WriteStringWithDefault(2, m.ServerPlatform)
+		w.WriteUintWithDefault(3, m.QuackVersion)
+		w.WriteUintWithDefault(4, m.HeartbeatTimeoutSeconds)
 	})
+	return nil
 }
 
-func (m PrepareRequest) encode(w *codec.Writer) {
+func (m PrepareRequest) encode(w *codec.Writer) error {
+	var err error
 	w.WriteObject(func(w *codec.Writer) {
-		writeOptionalString(w, 1, m.SQL)
+		w.WriteStringWithDefault(1, m.SQL)
+		writeHugeInt(w, 2, m.QueryUUID)
+		err = writeIdx(w, 3, "PrepareRequest inline_rows", m.InlineRows)
 	})
+	return err
 }
 
-func (m PrepareResponse) encode(w *codec.Writer) {
+func (m PrepareResponse) encode(w *codec.Writer) error {
+	var err error
 	w.WriteObject(func(w *codec.Writer) {
 		if len(m.ResultTypes) > 0 {
 			w.WriteField(1, func(w *codec.Writer) {
@@ -93,61 +122,118 @@ func (m PrepareResponse) encode(w *codec.Writer) {
 				}
 			})
 		}
-		if m.NeedsMoreFetch {
-			w.WriteField(3, func(w *codec.Writer) { w.WriteBool(true) })
-		}
+		writeBool(w, 3, m.NeedsMoreFetch)
 		if len(m.Results) > 0 {
-			w.WriteField(4, func(w *codec.Writer) { writeChunkPointerList(w, m.Results) })
+			// Each element is a present byte and a DataChunkWrapper {300: DataChunk}.
+			w.WriteField(4, func(w *codec.Writer) {
+				w.WriteULEB128(uint64(len(m.Results)))
+				for i, c := range m.Results {
+					w.WriteBool(true)
+					w.WriteFieldID(300)
+					if err = writeDataChunk(w, c); err != nil {
+						err = fmt.Errorf("message: PrepareResponse result %d: %w", i, err)
+						return
+					}
+					w.WriteEndObject()
+				}
+			})
 		}
-		w.WriteField(5, func(w *codec.Writer) { w.WriteHugeInt(m.ResultUUID) })
+		writeHugeInt(w, 5, m.QueryUUID)
 	})
+	return err
 }
 
-func (m FetchRequest) encode(w *codec.Writer) {
+func (m FetchRequest) encode(w *codec.Writer) error {
 	w.WriteObject(func(w *codec.Writer) {
-		w.WriteField(1, func(w *codec.Writer) { w.WriteHugeInt(m.ResultUUID) })
+		writeHugeInt(w, 1, m.QueryUUID)
+		w.WriteUintWithDefault(2, m.BatchIndex)
+		w.WriteUintWithDefault(3, m.AckIndex)
 	})
+	return nil
 }
 
-func (m FetchResponse) encode(w *codec.Writer) {
+func (m FetchResponse) encode(w *codec.Writer) error {
+	var err error
 	w.WriteObject(func(w *codec.Writer) {
-		if len(m.Results) > 0 {
-			w.WriteField(1, func(w *codec.Writer) { writeChunkPointerList(w, m.Results) })
+		w.WriteUintWithDefault(1, uint64(len(m.Results)))
+		if err = writeIdx(w, 2, "FetchResponse total_batches", m.TotalBatches); err == nil {
+			err = writeIdx(w, 3, "FetchResponse batch_index", m.BatchIndex)
 		}
-		w.WriteField(2, func(w *codec.Writer) {
-			if m.HasBatchIndex {
-				w.WriteULEB128(m.BatchIndex)
-			} else {
-				w.WriteULEB128(optionalIndexInvalid)
-			}
-		})
 	})
-}
-
-func (m AppendRequest) encode(w *codec.Writer) {
-	w.WriteObject(func(w *codec.Writer) {
-		writeOptionalString(w, 1, m.SchemaName)
-		writeOptionalString(w, 2, m.TableName)
-		w.WriteField(3, func(w *codec.Writer) {
-			w.WriteBool(true)
-			encodeDataChunkWrapper(w, m.AppendChunk)
-		})
-	})
-}
-
-func (SuccessResponse) encode(w *codec.Writer)   { w.WriteObject(func(*codec.Writer) {}) }
-func (DisconnectMessage) encode(w *codec.Writer) { w.WriteObject(func(*codec.Writer) {}) }
-
-func (m ErrorResponse) encode(w *codec.Writer) {
-	w.WriteObject(func(w *codec.Writer) {
-		writeOptionalString(w, 1, m.Message)
-	})
-}
-
-func writeChunkPointerList(w *codec.Writer, chunks []DataChunk) {
-	w.WriteULEB128(uint64(len(chunks)))
-	for _, c := range chunks {
-		w.WriteBool(true)
-		encodeDataChunkWrapper(w, c)
+	if err != nil {
+		return err
 	}
+	return writeChunks(w, "FetchResponse", m.Results)
+}
+
+func (m SendDataRequest) encode(w *codec.Writer) error {
+	var err error
+	w.WriteObject(func(w *codec.Writer) {
+		w.WriteStringWithDefault(1, m.StreamID)
+		w.WriteUintWithDefault(2, uint64(len(m.Chunks)))
+		if err = writeIdx(w, 3, "SendDataRequest total_batches", m.TotalBatches); err == nil {
+			err = writeIdx(w, 4, "SendDataRequest batch_index", m.BatchIndex)
+		}
+	})
+	if err != nil {
+		return err
+	}
+	return writeChunks(w, "SendDataRequest", m.Chunks)
+}
+
+// writeChunks appends the raw DataChunk objects that follow a FETCH_RESPONSE
+// or SEND_DATA_REQUEST body. Upstream never sends an empty chunk
+// (QuackChunkPayloadWriter::AppendChunk asserts size > 0), and
+// scan_data_from_quack_client would take one for the end of the scan.
+func writeChunks(w *codec.Writer, msg string, chunks []DataChunk) error {
+	for i, c := range chunks {
+		if c.RowCount == 0 {
+			return fmt.Errorf("message: %s chunk %d has no rows", msg, i)
+		}
+		if err := writeDataChunk(w, c); err != nil {
+			return fmt.Errorf("message: %s chunk %d: %w", msg, i, err)
+		}
+	}
+	return nil
+}
+
+func (m SendDataResponse) encode(w *codec.Writer) error {
+	var err error
+	w.WriteObject(func(w *codec.Writer) {
+		w.WriteField(1, func(w *codec.Writer) { err = w.WriteOptionalIdx(m.AcceptBudget) }) // always written
+	})
+	if err != nil {
+		return fmt.Errorf("message: SendDataResponse accept_budget: %w", err)
+	}
+	return nil
+}
+
+func (m CancelRequest) encode(w *codec.Writer) error {
+	w.WriteObject(func(w *codec.Writer) { writeHugeInt(w, 1, m.QueryUUID) })
+	return nil
+}
+
+func (m Acknowledgement) encode(w *codec.Writer) error {
+	w.WriteObject(func(w *codec.Writer) {
+		if m.QueryUUID != (codec.HugeInt{}) { // written with the default hugeint_t(0, 0)
+			writeHugeInt(w, 1, m.QueryUUID)
+		}
+	})
+	return nil
+}
+
+func (HeartbeatRequest) encode(w *codec.Writer) error  { w.WriteEndObject(); return nil }
+func (SuccessResponse) encode(w *codec.Writer) error   { w.WriteEndObject(); return nil }
+func (DisconnectMessage) encode(w *codec.Writer) error { w.WriteEndObject(); return nil }
+
+func (m ErrorResponse) encode(w *codec.Writer) error {
+	w.WriteObject(func(w *codec.Writer) {
+		w.WriteStringWithDefault(1, m.Message)
+		w.WriteStringWithDefault(2, m.ExceptionType)
+		if len(m.ExtraInfo) > 0 {
+			w.WriteField(3, func(w *codec.Writer) { w.WriteStringMap(m.ExtraInfo) })
+		}
+		writeBool(w, 4, m.MustInvalidate)
+	})
+	return nil
 }

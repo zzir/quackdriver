@@ -1,0 +1,22 @@
+version: 2
+updates:
+  # The actions used by .github/workflows. Go and golangci-lint in
+  # .tool-versions are not covered: the canary workflow flags those.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ['*']
+
+  # examples/bun is the only module with dependencies; the driver has none.
+  - package-ecosystem: gomod
+    directory: /examples/bun
+    schedule:
+      interval: monthly
+    ignore:
+      - dependency-name: github.com/zzir/quackdriver # replaced by ../..
+    groups:
+      bun:
+        patterns: ['*']

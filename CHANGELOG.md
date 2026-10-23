@@ -2,7 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
-The format follows [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/); the project follows [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html). While the protocol is in alpha (pre-DuckDB v2.0), **minor versions may include breaking wire-format changes** to track the upstream Quack protocol. Major-version compatibility kicks in once Quack reaches v1.0.
+The format follows [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/); the project follows [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html). While the driver is pre-1.0 (`v0.x`), **minor versions may include breaking changes**, including a move to a newer Quack protocol version when a DuckDB release changes it; patch versions do not. The driver currently speaks Quack protocol v3 (DuckDB 2.0); the API is to stabilize with v1.0.0.
+
+## [Unreleased]
+
+Rewrite for Quack protocol **v3** (DuckDB 2.0). This is a breaking upgrade: DuckDB 1.x servers (Quack v1) are no longer supported, and the handshake reports that DuckDB 2.0 or newer is required.
+
+### Changed — breaking
+
+- Go 1.26 or newer is required (was 1.22): the oldest Go release still maintained upstream. The minimum now follows Go's support policy and moves up when a new Go release ships. The driver's own tests therefore run with the runtime defaults users get, such as post-quantum TLS key exchange, instead of Go 1.22 compatibility settings.
+- Wire protocol v3: `PREPARE` with inline rows, numbered `FETCH` batches with acknowledgements and read-ahead (`fetch_ahead`, default 1), heartbeats keeping the session lease, `CANCEL` on context cancellation, `DISCONNECT` on close. HTTP/1.1 with the `application/vnd.duckdb` media type.
+- `APPEND_REQUEST` is gone; `Conn.Append` now streams rows with `SEND_DATA` into one `INSERT ... SELECT ... FROM scan_data_from_quack_client(...)` statement.
+- `Conn.Append` and the `Appender` send every value as text (VARCHAR chunks) that the server casts to the column's `Type`, so DuckDB's own cast rules apply. `AppendColumn.Type` is resolved by the server (one extra statement when an `Appender` starts): any DuckDB type expression works, user-defined types included, and only what DuckDB accepts (the driver's `LIST(T)` spelling is gone; use `T[]`). Ranges and formats are checked by the server: an out-of-range integer, a malformed value, an unknown ENUM label or a duplicate MAP key now fails the statement with a `*Error` instead of a `*ValueError`, and a DECIMAL string with more fractional digits than the scale is rounded instead of rejected. `Conn.Append` starts the INSERT before converting the rows and aborts it at the first row it cannot convert; nothing is inserted either way. UNION columns can no longer be appended (DuckDB's cast from text picks the member itself).
+- VARIANT values are no longer decoded: a result with a VARIANT column, also nested, fails with an error suggesting a cast such as `v::JSON`.
+- DSN: `timeout` now defaults to none (was 30s); TLS defaults to on for non-local hosts; unknown parameters are rejected. New parameters `disable_ssl`, `ssl_fingerprint`, `connect_timeout`, `heartbeat_timeout`, `client_id`, `inline_rows`, `fetch_ahead`.
+- `RowsAffected` reports DuckDB's changed-row counts (DML, `COPY`, `CREATE TABLE ... AS`, the row count of `RETURNING`); `LastInsertId` returns an error.
+- `TIME WITH TIME ZONE` decodes to `TimeTzValue` with accessors (built with `NewTimeTz`; the zero value is `00:00:00+00`); `IntervalValue` and `TimeTzValue` are re-exported from the root package. `float64` arguments are sent as DOUBLE literals and `*big.Rat` as DECIMAL literals of at most 38 digits.
+- `AppendColumn.Name` now selects the target column: when every column has a name, the rows are inserted with `INSERT INTO t ("name", ...)`, so values map to table columns **by name** (in v0.1 names only appeared in error messages and values mapped by position). Names that are not table columns fail with a Binder error; leave a `Name` empty to keep the positional mapping.
+- Appending a float to a `DECIMAL` column rounds like DuckDB's `DOUBLE` → `DECIMAL` cast (multiply by 10^scale, round half away from zero) instead of formatting the binary value half-to-even; appending a `time.Time` to a timestamp column of lower precision rounds to the nearest unit, halves away from the epoch, like DuckDB's timestamp casts (it used to floor). Both now store what `INSERT ... VALUES (?)` stores.
+- A nil `[]byte` is NULL, as a query argument and in `Append`/`Appender` (it was an empty BLOB or VARCHAR).
+- The client no longer rejects tokens shorter than 4 characters: the server's authentication function decides.
+- An empty `ssl_fingerprint=` is rejected like any other malformed value instead of silently disabling the pin.
+- A connection that gets no answer from the server for a whole heartbeat lease is marked gone (the server has expired the session by then) instead of retrying heartbeats forever; `database/sql` then replaces it.
+
+### Added
+
+- DSN parameter `max_buffered_rows` (default 1,000,000): the most rows of an open `Rows` buffered in memory when another statement starts on its connection; beyond it the new statement fails and the `Rows` stays readable.
+- `Conn.ServerInfo()` reports the server's DuckDB version, platform, Quack protocol version and granted heartbeat lease.
+
+- Streaming `Appender` (`NewAppender`, `AppendRow`, `Flush`, `Close` returning the inserted count, `Abort`, `WithBatchBytes`, `WithUnordered`), `ErrConnBusy`, and `ValueError` for rows that cannot be converted.
+- `*Error` with DuckDB's exception type and extra info.
+- `NewConnector` with `WithTLSConfig`, `WithHeader`, `WithMaxIdleConnsPerHost` and `WithHTTPClient`; certificate pinning with `ssl_fingerprint`. HTTP redirects are never followed.
+- DSN parameter `timezone` (`SET SESSION TimeZone` after each handshake), for `time.Time` arguments that meet `TIMESTAMPTZ` values.
+- A result read to its end through `FETCH`, or of at least 2048 rows returned whole by `PREPARE`, is acknowledged (`ACKNOWLEDGEMENT`), so a server with `quack_enable_reconnects` frees its retained copy.
+- New types: `TIMESTAMPTZ_NS`, `TUPLE`, `BIGNUM`, `GEOMETRY` (read, WKB), `JSON` and other aliases; DuckDB's ±infinity dates and timestamps as `InfinityTime` / `NegInfinityTime`, which are also written back as infinity.
+- Placeholders `?N`, `$N` and `$name` (`sql.Named`).
+- Integration test suite against real DuckDB 2.0 servers (`go test -tags integration ./...`); golden wire fixtures captured from the official DuckDB v2.0.0 release CLI (quack extension `f96420e`).
+
+### Removed
+
+- Local mode (`quack:local[/path]`, which started a DuckDB CLI for the driver) and `CloseLocalServers`: run a server with `quack_serve` and connect to it. A `quack:local` DSN is rejected with an error saying so.
+- The examples are consolidated into `basic`, `types`, `append`, `tls-pin`, `bench-append` and `bun` (now on bun v1.3.0).
+- Development tooling is trimmed: `make test` is the unit tests, `make test-integration` the whole suite (which builds and runs the examples), `make lint` what CI lints; `make server`, `make bench` and `make dump-wire` stay. Gone are `make test-unit`/`test-go-integration`/`test-examples`/`test-bun`/`server-bg`/`stop`/`clean`/`help`, `scripts/dump-wire.sh` (`cmd/dump-wire` now reads `QUACK_HOST`/`QUACK_PORT`/`QUACK_TOKEN` or `QUACK_DSN` like the examples) and `scripts/run-examples.sh`. `scripts/start-quack-server.sh` drops `QUACK_EXTENSION_REPO` and `QUACK_LOG`; its `QUACK_TEST_INIT_SQL` replaces the default `INSTALL quack; LOAD quack;`, as in the integration tests. `.tool-versions` pins the Go and golangci-lint used by `make lint` and CI's lint job (`make lint` refuses others); Dependabot updates the GitHub Actions and the bun example's dependencies, and a weekly `canary` workflow flags when a new Go or golangci-lint release calls for a bump.
 
 ## [0.1.0-alpha.1] — 2026-05-25
 
